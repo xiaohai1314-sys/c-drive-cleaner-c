@@ -146,3 +146,24 @@ export interface HistoryEntry {
   size: number;
   mtime: number;
 }
+
+/** 常驻索引：一卷的索引状态（Rust index_status 返回）。 */
+export interface IndexVolumeState {
+  drive: string;
+  /** fresh | behind | stale | missing | unavailable */
+  state: string;
+  files: number;
+  with_full: number;
+  /** USN 游标更新时间（unix 秒），没有游标时 0。 */
+  updated_at: number;
+}
+
+export interface IndexState {
+  volumes: IndexVolumeState[];
+}
+
+/** 计划任务 \CDriveCleaner\Index 的状态（Rust index_task_status 返回）。 */
+export interface IndexTaskState {
+  exists: boolean;
+  enabled: boolean;
+}

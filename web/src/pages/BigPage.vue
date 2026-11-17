@@ -2,6 +2,7 @@
 import { computed, onMounted } from "vue";
 import { invoke } from "../api/tauri";
 import type { BigFile, DeleteReport } from "../api/types";
+import IndexBar from "../components/IndexBar.vue";
 import { showConfirm } from "../composables/useModal";
 import { cancelActiveScan, scanStatus, startScanStatus, stopScanStatus } from "../composables/useScanStatus";
 import { toast } from "../composables/useToast";
@@ -9,6 +10,7 @@ import { BIG_KINDS, BIG_NAMES, type BigKind } from "../config/sidebar";
 import { openFile, revealFile } from "../lib/files";
 import { diskOf, fmtSize, fmtTime, kindOf } from "../lib/format";
 import { BIG_PAGE, bigChecked, bigLoading, bigRows, bigShown, bigTab } from "../stores/big";
+import { refreshIndexStatus, refreshIndexTask } from "../stores/index";
 
 const totals = computed(() => {
   const result: Record<string, number> = { all: 0 };
@@ -65,6 +67,8 @@ async function scan() {
   bigLoading.value = true;
   bigShown.value = BIG_PAGE;
   startScanStatus();
+  await refreshIndexStatus();
+  await refreshIndexTask();
   try {
     bigRows.value = await invoke<BigFile[]>("scan_big");
   } catch (error) {
@@ -101,6 +105,8 @@ async function removeSelected() {
 }
 
 onMounted(() => {
+  void refreshIndexStatus();
+  void refreshIndexTask();
   if (!bigRows.value.length && !bigLoading.value) void scan();
 });
 </script>
@@ -134,6 +140,8 @@ onMounted(() => {
     <button class="smart-btn" @click="selectNone">取消全选</button>
     <span class="muted">已勾选 {{ chosen.length }} 个，共 {{ fmtSize(chosenSize) }}</span>
   </div>
+
+  <IndexBar :busy="bigLoading" @synced="scan" />
 
   <div class="table">
     <div class="thead" style="grid-template-columns: 28px 1fr 60px 90px 130px 105px">

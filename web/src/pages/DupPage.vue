@@ -2,10 +2,12 @@
 import { computed, onMounted } from "vue";
 import { invoke } from "../api/tauri";
 import type { DeleteReport, DupGroup } from "../api/types";
+import IndexBar from "../components/IndexBar.vue";
 import { showConfirm } from "../composables/useModal";
 import { cancelActiveScan, scanStatus, startScanStatus, stopScanStatus } from "../composables/useScanStatus";
 import { toast } from "../composables/useToast";
 import { drives } from "../stores/app";
+import { refreshIndexStatus, refreshIndexTask } from "../stores/index";
 import { applyKeeperRule, pickKeeper } from "../lib/dup";
 import { openFile, revealFile } from "../lib/files";
 import { fmtSize, fmtTime } from "../lib/format";
@@ -116,6 +118,8 @@ function togglePath(path: string, keeper: string) {
 async function scan() {
   dupLoading.value = true;
   startScanStatus();
+  await refreshIndexStatus();
+  await refreshIndexTask();
   try {
     let root: string | null = null;
     let pickedDrives: string[] | null = null;
@@ -184,6 +188,8 @@ async function removeSelected() {
 }
 
 onMounted(() => {
+  void refreshIndexStatus();
+  void refreshIndexTask();
   if (!dupGroups.value.length && !dupLoading.value && dupScope.value !== "PICK") void scan();
 });
 </script>
@@ -234,6 +240,8 @@ onMounted(() => {
     <button class="smart-btn" @click="checkAllCopies">全选所有副本</button>
     <button class="smart-btn" @click="uncheckAll">取消全选</button>
   </div>
+
+  <IndexBar :busy="dupLoading" @synced="scan" />
 
   <div v-if="!dupGroups.length" class="empty">
     {{

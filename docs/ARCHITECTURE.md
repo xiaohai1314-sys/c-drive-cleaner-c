@@ -56,12 +56,13 @@ cdc-c/
 
 - JS → C：`chrome.webview.postMessage(JSON.stringify({id, cmd, args}))`。
 - C → JS：`host.eval("window.__cdc_onMessage(" + json + ")")`；Vue 侧 `api.js` 按 id 配对 Promise，另收 `event` 推送（进度/流式结果）。
-- 命令清单以 `main.rs` 里 `#[tauri::command]` 的函数为准，**名字与参数原样镜像**，包括：scan_big、scan_dups、clean、delete_dups、index_status、index_sync_now、index_rebuild、index_task_status/run/set_enabled/register/delete、frag、privacy、im、system 各命令。桥实现者先从 main.rs 抽出完整清单写进 `docs/bridge-commands.md`，再开工。
+- 命令清单以 `main.rs` 里 `#[tauri::command]` 的函数为准，**名字与参数原样镜像**，包括：scan_big、scan_dups、clean、delete_dups、index_status、index_sync_now、index_rebuild、index_task_status/run/set_enabled/register/delete、frag、privacy、im、system 各命令。完整清单见 `docs/bridge-commands.md`（45 个命令，已抽完，2026-11-17）；实现见 `host/bridge.{h,cpp}` 与 `web/src/api/bridge.ts`，接线细节见 `docs/frontend-bridge.md`。
 - 数据 JSON 形态与 Rust 版 `invoke` 返回一致：FileEntry{path,size,mtime,frn}、DupGroup、BigFile。时间用毫秒时间戳。
+- 注意：宿主不走 `file://` 直接加载 dist（Vite 的 ES module 脚本会被 Chromium 以 CORS 拦截），改用 `https://cdc.local/` 虚拟域名映射 dist/（`host/host.cpp` 的 WebResourceRequested 回调），见 `docs/frontend-bridge.md`「构建接线」。
 
 ## 4. 宿主与构建
 
-- 宿主：优先用开源 `webview/webview` 库（C API：create/bind/eval/run）；评估者先确认它在 MinGW 下能编过、能跑通 postMessage 双向；若不行，退回手写 WebView2 COM（C++）。
+- 宿主：优先用开源 `webview/webview` 库（C API：create/bind/eval/run）；评估者先确认它在 MinGW 下能编过、能跑通 postMessage 双向；若不行，退回手写 WebView2 COM（C++）。评估已完成（2026-11-17，见 `docs/frontend-bridge.md`「webview/webview 替代方案评估」）：建议切，但先交付的原生 COM 方案（`host/`）保持可用，切换窗口选在 CMake 接线完成后一次性做。
 - Vue：Vue 3 + Vite，单页应用，8 个页面做 tab 视图（不用 vue-router 也行）；`index.html`、`style.css`、`app.js` 的现有视觉与文案尽量复用，组件化重写。
 - 构建：CMake。Debug/Release；Release 开 `-O2 -s`（strip）。本机用 llvm-mingw 交叉编译验证（`~/workspace/.scratch/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64/bin`），用户机器用 MSVC 或 MinGW。
 - 打包：先出 `cdc.exe + dist/ + rules.json` 能跑；NSIS 安装器随后；MSI 再后。
