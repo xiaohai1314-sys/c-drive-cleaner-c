@@ -1,0 +1,9 @@
+build/
+*.exe
+*.dll
+*.lib
+*.obj
+node_modules/
+web/dist/
+tests/fixtures/
+.DS_Store
