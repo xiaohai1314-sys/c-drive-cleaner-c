@@ -46,16 +46,28 @@ typedef struct {
     uint8_t bytes[CDC_DIGEST_LEN];
 } cdc_digest_t;
 
-/* 一组四种摘要；has_* 为 0 时对应字段无意义（SQL NULL）。 */
+/* 一组四种摘要；has_* 为 0 时对应字段无意义（SQL NULL）。
+ *
+ * 采样层（head / sample / strong）自 xxHash 改造后是 XXH3-64，存在
+ * head_xxh / sample_xxh / strong_xxh（uint64_t，SQL INTEGER 列）；
+ * head / sample / strong 三个 32 字节字段是旧版 BLAKE3 值——C 管线
+ * 不再计算，只做透传（从缓存/索引读到就原样写回去，供 Rust 版读）；
+ * full 仍是 BLAKE3 32 字节（最终确认，共享 full 列，兼容）。 */
 typedef struct {
     int has_head;
     int has_sample;
     int has_strong;
     int has_full;
+    int has_head_xxh;
+    int has_sample_xxh;
+    int has_strong_xxh;
     cdc_digest_t head;
     cdc_digest_t sample;
     cdc_digest_t strong;
     cdc_digest_t full;
+    uint64_t head_xxh;
+    uint64_t sample_xxh;
+    uint64_t strong_xxh;
 } cdc_digest_set_t;
 
 /* 一条文件元数据记录（摘要另由 cdc_digest_update_t 写）。path 为借用指针。 */
@@ -76,6 +88,13 @@ typedef struct {
     uint64_t mtime;
     cdc_digest_set_t digests;
 } cdc_digest_update_t;
+
+/* 一卷已存摘要的一条：(frn, digests)。all_digests 返回的数组按 frn 升序，
+ * 只含至少一种摘要的行；无 owned 指针，调用方直接 free() 数组。 */
+typedef struct {
+    uint64_t frn;
+    cdc_digest_set_t digests;
+} cdc_index_digest_entry_t;
 
 /* 哈希补算 / 重复查询的输入行：元数据 + 已有摘要（可能没有）。
  * path 为 malloc 的字符串。 */
@@ -151,6 +170,17 @@ cdc_index_hash_row_t *cdc_fileindex_rows_needing_full(cdc_fileindex_t *idx,
                                                       uint64_t volume_serial,
                                                       size_t *out_n);
 void cdc_index_hash_rows_free(cdc_index_hash_row_t *rows, size_t n);
+
+/* 一卷已存的全部摘要（按 frn 升序）。回填播种用：upsert 之后读回，
+ * 索引里保留的摘要可直接复用——FRN 是主键，文件改名/移动后仍在；
+ * hashcache 的 file_hashes 按 path 主键、且 30 天未见即剪枝，
+ * 改名或久未跑 live 扫描后缓存里已没有，索引里还有。
+ * upsert 已保证：size/mtime 变了的行摘要已清 NULL，所以读回的摘要
+ * 与当前文件一致，与缓存播种是同一信任级别。
+ * 返回 malloc 的数组（可能为 NULL 且 *out_n=0），调用方 free()。 */
+cdc_index_digest_entry_t *cdc_fileindex_all_digests(cdc_fileindex_t *idx,
+                                                    uint64_t volume_serial,
+                                                    size_t *out_n);
 
 /* 清掉一卷的全部索引行和 USN 游标（--rebuild 用）。 */
 void cdc_fileindex_delete_volume(cdc_fileindex_t *idx, uint64_t volume_serial);

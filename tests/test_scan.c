@@ -5,13 +5,19 @@
  * 退出码 = 失败断言数。
  *
  * 依赖：src/mft.c、fastio.c、hashcache.c、scan.c、util.c、bigfile.c、
- *       mft_util.c、third_party/blake3（intrinsics 版）、
- *       third_party/sqlite3、third_party/cjson（CDC_HAVE_CJSON 时）。
+ *       mft_util.c、sampling.c、third_party/blake3（intrinsics 版）、
+ *       third_party/xxhash、third_party/sqlite3、
+ *       third_party/cjson（CDC_HAVE_CJSON 时）。
  * 不依赖 fileindex.c / indextask.c / mft_raw.c（只用 fileindex.h 的类型）。
  */
 #define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE
+/* 注意：必须带值 1，不能写裸 #define _DEFAULT_SOURCE——
+ * mimalloc 的 -include wrapper（src/cdc_mimalloc_override.h）先包含
+ * 系统头，features.h 已把 _DEFAULT_SOURCE 归一化为 1；裸定义再定义一次
+ * 会触发 -Werror 的 macro-redefined。 */
+#define _DEFAULT_SOURCE 1
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -19,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -27,6 +34,7 @@
 #include "fastio.h"
 #include "hashcache.h"
 #include "mft.h"
+#include "sampling.h"
 #include "scan.h"
 #include "sqlite3.h"
 
@@ -763,12 +771,14 @@ static void test_fastio(void) {
     CHECK_INT(cdc_query_file_identity("/tmp/cdc-test-no-such-file.bin", &idA), 0,
               "missing no id");
 
-    /* iocp_read_heads：摘要 == blake3(前 4KB)，ticks == 请求数（含失败请求）。 */
+    /* iocp_read_heads：摘要 == xxh3(前 4KB) 的 32 字节载体编码，
+     * ticks == 请求数（含失败请求）。 */
     static char headA[4096], headC[100];
     memset(headA, 'A', sizeof headA);
     memset(headC, 'C', sizeof headC);
-    cdc_digest_t expA = blake3_of(headA, 4096);
-    cdc_digest_t expC = blake3_of(headC, 100);
+    cdc_digest_t expA, expC;
+    cdc_xxh3_buf_to_digest32((const uint8_t *)headA, 4096, expA.bytes);
+    cdc_xxh3_buf_to_digest32((const uint8_t *)headC, 100, expC.bytes);
     CdcIocpRequest reqs[3];
     reqs[0].idx = 0; reqs[0].path = pa; reqs[0].frn = 0; reqs[0].want = 4096;
     reqs[1].idx = 1; reqs[1].path = pc; reqs[1].frn = 0; reqs[1].want = 4096;
@@ -1026,7 +1036,497 @@ static void test_hash_groups(void) {
     printf("scan_hash_groups done\n");
 }
 
+/* ---------------- 6. sampling（XXH3-64） ---------------- */
+
+static void test_sampling(void) {
+    printf("== sampling ==\n");
+    /* XXH3-64 已知向量：空输入（seed 0）= 0x2d06800538d394c2。 */
+    CHECK_U64(cdc_xxh3_64(NULL, 0), 0x2d06800538d394c2ULL, "xxh3 empty vector");
+    CHECK_U64(cdc_xxh3_64((const uint8_t *)"", 0), 0x2d06800538d394c2ULL, "xxh3 empty str");
+    /* 确定性 + 流式与一次性一致。 */
+    static const uint8_t data[] = "the quick brown fox jumps over the lazy dog";
+    uint64_t a = cdc_xxh3_64(data, sizeof data - 1);
+    uint64_t b = cdc_xxh3_64(data, sizeof data - 1);
+    CHECK_U64(a, b, "xxh3 deterministic");
+    CHECK(a != 0, "xxh3 nonzero");
+    cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+    CHECK(st != NULL, "xxh3 state new");
+    if (st) {
+        CHECK_INT(cdc_xxh3_state_update(st, data, 10), 0, "xxh3 update 1");
+        CHECK_INT(cdc_xxh3_state_update(st, data + 10, sizeof data - 1 - 10), 0,
+                  "xxh3 update 2");
+        CHECK_U64(cdc_xxh3_state_finalize(st), a, "xxh3 streaming == oneshot");
+        cdc_xxh3_state_free(st);
+    }
+    /* 载体编码往返 + hex。 */
+    uint8_t carrier[32];
+    cdc_xxh_to_digest32(a, carrier);
+    CHECK_U64(cdc_xxh_from_digest32(carrier), a, "xxh carrier roundtrip");
+    CHECK(carrier[8] == 0 && carrier[31] == 0, "xxh carrier zero tail");
+    uint8_t buf2[32];
+    cdc_xxh3_buf_to_digest32(data, sizeof data - 1, buf2);
+    CHECK(memcmp(buf2, carrier, 32) == 0, "xxh buf_to_digest32");
+    char hex[17];
+    cdc_xxh_to_hex(a, hex);
+    CHECK(strlen(hex) == 16, "xxh hex len");
+    uint64_t back = 0;
+    for (int i = 0; i < 16; i++) {
+        char ch = hex[i];
+        CHECK((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'), "xxh hex lowercase");
+        unsigned v = (ch >= '0' && ch <= '9') ? (unsigned)(ch - '0') : (unsigned)(ch - 'a' + 10);
+        back = (back << 4) | v;
+    }
+    CHECK_U64(back, a, "xxh hex roundtrip");
+    printf("sampling done\n");
+}
+
+/* ---------------- 7. hashcache 与旧版 BLAKE3 full 的兼容 ---------------- */
+
+static void test_hashcache_xxh_compat(void) {
+    printf("== hashcache xxh compat ==\n");
+    char dir_tmpl[] = "/tmp/cdc-test-xc-XXXXXX";
+    if (!mkdtemp(dir_tmpl)) { perror("mkdtemp"); exit(2); }
+    char dbpath[PATH_MAX];
+    join_path(dbpath, sizeof dbpath, dir_tmpl, "hash-cache-v3.db");
+    uint64_t now = cdc_now_seconds();
+    const char *p = "/tmp/compat.bin";
+
+    /* 1. 预置一条"旧版"记录：只有 BLAKE3 full（模拟 Rust 版或旧版 C
+     *    写下的库），xxh 三列全 NULL。 */
+    cdc_digest_t full = blake3_of("compat-content", 14);
+    cdc_hashcache_t *hc = cdc_hashcache_open_at(dbpath, 0);
+    CHECK(hc != NULL, "compat open");
+    cdc_digest_set_t s;
+    memset(&s, 0, sizeof s);
+    s.has_full = 1;
+    s.full = full;
+    CHECK_INT(cdc_hashcache_remember(hc, p, 1234, 5678, &s, now), 0, "compat remember full");
+    CHECK_INT(cdc_hashcache_save_dirty(hc), 0, "compat save");
+    cdc_hashcache_close(hc);
+    CHECK(db_blob_equals(dbpath, "SELECT full FROM file_hashes WHERE path='/tmp/compat.bin'",
+                         full.bytes, 32),
+          "compat full stored");
+    CHECK_INT(db_query_int(dbpath, "SELECT head_xxh IS NULL FROM file_hashes WHERE path='/tmp/compat.bin'"),
+              1, "compat head_xxh null before xxh write");
+
+    /* 2. 重开读回（走默认库路径，与 test_hashcache 同一套路）：
+     *    full 命中且值不变，xxh 三档都没有。 */
+    setenv("LOCALAPPDATA", dir_tmpl, 1);
+    char defpath[PATH_MAX];
+    CHECK_INT(cdc_hashcache_default_path(defpath, sizeof defpath), 0, "compat default path");
+    {
+        char cmd[PATH_MAX * 2 + 64];
+        snprintf(cmd, sizeof cmd, "cp '%s' '%s'", dbpath, defpath);
+        CHECK_INT(system(cmd), 0, "compat copy db to default path");
+    }
+    const char *paths[] = {p};
+    cdc_hashcache_t *hc2 = cdc_hashcache_load_for_paths(paths, 1);
+    CHECK(hc2 != NULL, "compat load_for_paths");
+    cdc_digest_set_t out;
+    CHECK_INT(cdc_hashcache_entry_for(hc2, p, 1234, 5678, &out), 1, "compat entry found");
+    CHECK_INT(out.has_full, 1, "compat has_full");
+    CHECK(memcmp(out.full.bytes, full.bytes, 32) == 0, "compat full value kept");
+    CHECK_INT(out.has_head_xxh, 0, "compat no head_xxh yet");
+    CHECK_INT(out.has_sample_xxh, 0, "compat no sample_xxh yet");
+    CHECK_INT(out.has_strong_xxh, 0, "compat no strong_xxh yet");
+    cdc_hashcache_close(hc2);
+
+    /* 3. 再记一条 xxh head（模拟新版扫描），落盘后 full 仍是原来
+     *    的 BLAKE3 值、不被 xxHash 覆盖；head_xxh 落进新列。 */
+    uint64_t xhead = cdc_xxh3_64((const uint8_t *)"head-data", 9);
+    cdc_hashcache_t *hc3 = cdc_hashcache_open_at(dbpath, 0);
+    cdc_digest_set_t sx;
+    memset(&sx, 0, sizeof sx);
+    sx.has_head_xxh = 1;
+    sx.head_xxh = xhead;
+    /* open_at 不预加载：先把旧 full 记回内存（模拟 load_for_paths 已加载）。 */
+    cdc_digest_set_t sf;
+    memset(&sf, 0, sizeof sf);
+    sf.has_full = 1;
+    sf.full = full;
+    CHECK_INT(cdc_hashcache_remember(hc3, p, 1234, 5678, &sf, now), 0, "compat reseed full");
+    CHECK_INT(cdc_hashcache_remember(hc3, p, 1234, 5678, &sx, now), 0, "compat remember xxh");
+    CHECK_INT(cdc_hashcache_save_dirty(hc3), 0, "compat save xxh");
+    cdc_hashcache_close(hc3);
+    CHECK(db_blob_equals(dbpath, "SELECT full FROM file_hashes WHERE path='/tmp/compat.bin'",
+                         full.bytes, 32),
+          "compat full not overwritten by xxh");
+    CHECK_INT(db_query_int(dbpath, "SELECT head_xxh FROM file_hashes WHERE path='/tmp/compat.bin'"),
+              (int64_t)xhead, "compat head_xxh stored");
+    CHECK_INT(db_query_int(dbpath, "SELECT head IS NULL FROM file_hashes WHERE path='/tmp/compat.bin'"),
+              1, "compat head blob still null (xxh not in blake3 col)");
+
+    /* 4. 旧库补列：手动建一个只有 7 列的表（模拟 Rust 版建的库），
+     *    打开后三列必须被补上。 */
+    char old_db[PATH_MAX];
+    join_path(old_db, sizeof old_db, dir_tmpl, "old-7col.db");
+    sqlite3 *odb = NULL;
+    CHECK_INT(sqlite3_open(old_db, &odb), SQLITE_OK, "old db open");
+    char *emsg = NULL;
+    sqlite3_exec(odb,
+                 "CREATE TABLE file_hashes (path TEXT PRIMARY KEY, size INTEGER NOT NULL,"
+                 " mtime INTEGER NOT NULL, head BLOB, sample BLOB, strong BLOB, full BLOB,"
+                 " last_seen INTEGER NOT NULL) WITHOUT ROWID;",
+                 NULL, NULL, &emsg);
+    sqlite3_close(odb);
+    cdc_hashcache_t *hco = cdc_hashcache_open_at(old_db, 0);
+    CHECK(hco != NULL, "old db open_at");
+    cdc_hashcache_close(hco);
+    CHECK_INT(db_query_int(old_db,
+                           "SELECT COUNT(*) FROM pragma_table_info('file_hashes')"
+                           " WHERE name IN ('head_xxh','sample_xxh','strong_xxh')"),
+              3, "old db xxh cols added");
+
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir_tmpl);
+    CHECK_INT(system(cmd), 0, "compat cleanup");
+    printf("hashcache xxh compat done\n");
+}
+
+/* 一组内是否恰好包含 names 全部（n 个）文件。 */
+static int group_has_all(const CdcDupGroupList *g, const char **names, size_t n) {
+    for (size_t i = 0; i < g->n; i++) {
+        if (g->items[i].n_files != n) continue;
+        int ok = 1;
+        for (size_t k = 0; k < n && ok; k++) {
+            int found = 0;
+            for (size_t j = 0; j < g->items[i].n_files; j++) {
+                if (strcmp(base_name(g->items[i].files[j]), names[k]) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) ok = 0;
+        }
+        if (ok) return 1;
+    }
+    return 0;
+}
+
+/* ---------------- 8. 并行（cdc_par_for / 共享锁） ---------------- */
+
+static int g_par_marks[1024];
+static void par_mark_work(void *ctx, size_t idx) {
+    (void)ctx;
+    g_par_marks[idx] = 1;
+}
+
+static int g_par_locked_total = 0;
+static void par_locked_work(void *ctx, size_t idx) {
+    (void)ctx;
+    (void)idx;
+    cdc_shared_lock();
+    g_par_locked_total++;
+    cdc_shared_unlock();
+}
+
+static void test_par(void) {
+    printf("== par ==\n");
+    CHECK_INT(cdc_par_cpu_count() >= 1, 1, "cpu count >= 1");
+    CHECK_INT(cdc_par_hash_workers(1) >= 1 && cdc_par_hash_workers(1) <= 32, 1,
+              "ssd workers range");
+    CHECK_INT(cdc_par_hash_workers(0) >= 1 && cdc_par_hash_workers(0) <= 32, 1,
+              "hdd workers range");
+    /* 1000 下标、8 线程：每一下标恰好处理一次。 */
+    memset(g_par_marks, 0, sizeof g_par_marks);
+    CHECK_INT(cdc_par_for(1000, 8, par_mark_work, NULL), 0, "par_for rc");
+    int all = 1;
+    for (int i = 0; i < 1000; i++) all &= (g_par_marks[i] == 1);
+    CHECK(all, "par_for each idx once");
+    /* 顺序退化：nthreads 0/1、n=0/1。 */
+    memset(g_par_marks, 0, sizeof g_par_marks);
+    CHECK_INT(cdc_par_for(1000, 1, par_mark_work, NULL), 0, "par_for 1 thread");
+    all = 1;
+    for (int i = 0; i < 1000; i++) all &= (g_par_marks[i] == 1);
+    CHECK(all, "par_for 1 thread each idx once");
+    CHECK_INT(cdc_par_for(0, 8, par_mark_work, NULL), 0, "par_for n=0");
+    CHECK_INT(cdc_par_for(1, 8, par_mark_work, NULL), 0, "par_for n=1");
+    /* 共享锁：8 线程 × 1000 次加锁递增，总数精确（无丢失更新）。 */
+    g_par_locked_total = 0;
+    CHECK_INT(cdc_par_for(8000, 8, par_locked_work, NULL), 0, "par_for locked rc");
+    CHECK_INT(g_par_locked_total, 8000, "par_for locked total");
+    printf("par done\n");
+}
+
+/* ---------------- 9. fixtures 上的 dup 端到端 ---------------- */
+
+static void test_scan_dups_fixtures(const char *fixtures) {
+    printf("== scan_dups fixtures (%s) ==\n", fixtures);
+    char cache_tmpl[] = "/tmp/cdc-test-dupsfx-cache-XXXXXX";
+    if (!mkdtemp(cache_tmpl)) { perror("mkdtemp"); exit(2); }
+    setenv("LOCALAPPDATA", cache_tmpl, 1);
+    const char *roots[] = { fixtures };
+    CdcScanOpts opts;
+    memset(&opts, 0, sizeof opts);
+    CdcDupGroupList g;
+    CHECK_INT(cdc_scan_dups(roots, 1, 1, &opts, &g), 0, "scan_dups fixtures rc");
+    /* 只有 movie.mp4 与 photo.jpg 同为 3MB 稀疏零 => 一组；
+     * 其余尺寸唯一，pagefile.sys 是系统名被排除。 */
+    CHECK_U64(g.n, 1, "scan_dups fixtures groups");
+    CHECK(group_has_files(&g, "movie.mp4", "photo.jpg"), "fixtures group");
+    cdc_dup_group_list_free(&g);
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", cache_tmpl);
+    CHECK_INT(system(cmd), 0, "cleanup dupsfx cache");
+    printf("scan_dups fixtures done\n");
+}
+
+/* ---------------- 10. 并行 dup（大文件 + 多文件 + tick 计数） ---------------- */
+
+/* 独立算整文件 blake3（对照 full_hash_by_frn 的结果；不用 scan.c 的函数）。 */
+static cdc_digest_t blake3_of_file(const char *path) {
+    cdc_digest_t d;
+    memset(&d, 0, sizeof d);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return d;
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    static uint8_t buf[1024 * 1024];
+    ssize_t r;
+    while ((r = read(fd, buf, sizeof buf)) > 0)
+        blake3_hasher_update(&h, buf, (size_t)r);
+    close(fd);
+    blake3_hasher_finalize(&h, d.bytes, 32);
+    return d;
+}
+
+static void test_par_dups(void) {
+    printf("== par_dups ==\n");
+    char dir_tmpl[] = "/tmp/cdc-test-pardups-XXXXXX";
+    if (!mkdtemp(dir_tmpl)) { perror("mkdtemp"); exit(2); }
+    char cache_tmpl[] = "/tmp/cdc-test-pardups-cache-XXXXXX";
+    if (!mkdtemp(cache_tmpl)) { perror("mkdtemp"); exit(2); }
+    setenv("LOCALAPPDATA", cache_tmpl, 1);
+    char p[PATH_MAX];
+    /* h 对：相同 20MB 稀疏（走 ≥16MB 的 2MB 缓冲全哈希）。 */
+    join_path(p, sizeof p, dir_tmpl, "h1.bin");
+    make_sparse(p, 20ULL * 1024 * 1024);
+    join_path(p, sizeof p, dir_tmpl, "h2.bin");
+    make_sparse(p, 20ULL * 1024 * 1024);
+    /* 12 个 64KB：6 个 'A' + 6 个 'B' => 两组。 */
+    for (int k = 0; k < 6; k++) {
+        char name[32];
+        snprintf(name, sizeof name, "pa%d.bin", k);
+        join_path(p, sizeof p, dir_tmpl, name);
+        write_repeat(p, 64 * 1024, 'A');
+        snprintf(name, sizeof name, "pb%d.bin", k);
+        join_path(p, sizeof p, dir_tmpl, name);
+        write_repeat(p, 64 * 1024, 'B');
+    }
+    const char *roots[] = { dir_tmpl };
+    CdcScanOpts opts;
+    memset(&opts, 0, sizeof opts);
+    opts.on_tick = tick_cb;
+    g_ticks = 0;
+    CdcDupGroupList g;
+    CHECK_INT(cdc_scan_dups(roots, 1, 1, &opts, &g), 0, "par_dups rc");
+    CHECK_U64(g.n, 3, "par_dups groups");
+    CHECK(group_has_files(&g, "h1.bin", "h2.bin"), "par group h");
+    static const char *want_a[] = { "pa0.bin", "pa1.bin", "pa2.bin",
+                                    "pa3.bin", "pa4.bin", "pa5.bin" };
+    static const char *want_b[] = { "pb0.bin", "pb1.bin", "pb2.bin",
+                                    "pb3.bin", "pb4.bin", "pb5.bin" };
+    CHECK(group_has_all(&g, want_a, 6), "par group A");
+    CHECK(group_has_all(&g, want_b, 6), "par group B");
+    /* h 组的 full 摘要 == 独立算出的整文件 blake3（验证 2MB 缓冲全哈希）。 */
+    for (size_t i = 0; i < g.n; i++) {
+        if (g.items[i].n_files == 2 &&
+            strcmp(base_name(g.items[i].files[0]), "h1.bin") == 0) {
+            char hp[PATH_MAX];
+            join_path(hp, sizeof hp, dir_tmpl, "h1.bin");
+            cdc_digest_t ref = blake3_of_file(hp);
+            char hex[65];
+            cdc_digest_to_hex(&ref, hex);
+            CHECK_STREQ(g.items[i].hash_hex, hex, "par h full digest");
+        }
+    }
+    /* tick 数与顺序语义一致：阶段 1 的 14 次 + 阶段 2 的 14 次 +
+     * 探针 2 次 + 阶段 3 的 14 次 = 44（64KB 组 36 + 20MB 组 8）。 */
+    CHECK_INT(g_ticks, 44, "par_dups ticks");
+    cdc_dup_group_list_free(&g);
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", dir_tmpl, cache_tmpl);
+    CHECK_INT(system(cmd), 0, "cleanup par_dups tmp");
+    printf("par_dups done\n");
+}
+
 /* ---------------- main ---------------- */
+
+/* ---------------- 8. fallback walk 与直接遍历等价 ----------------
+ * cdc_fallback_walk_files（新：走 cdc_enum_dir）与"逐项 opendir/readdir +
+ * lstat"参照实现在同一棵树上逐项比较：相对路径、大小、mtime 全等。
+ * 树含：文件、空文件、子目录、中文名、$ 开头名（跳过）、文件/目录
+ * 符号链接（不跟随）、悬空链接（不跟随）、skip_top 顶层目录（整棵跳过，
+ * 仅顶层生效——子目录同名不跳过）。 */
+typedef struct {
+    char **items; /* "relpath|size|mtime" */
+    size_t n, cap;
+} StrList;
+
+static void strlist_push(StrList *l, const char *s) {
+    if (l->n == l->cap) {
+        size_t nc = l->cap ? l->cap * 2 : 16;
+        char **p = (char **)realloc(l->items, nc * sizeof *p);
+        if (!p) {
+            perror("realloc");
+            exit(2);
+        }
+        l->items = p;
+        l->cap = nc;
+    }
+    l->items[l->n] = strdup(s);
+    if (!l->items[l->n]) {
+        perror("strdup");
+        exit(2);
+    }
+    l->n++;
+}
+
+static int strlist_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static void strlist_sort(StrList *l) {
+    if (l->n > 1) qsort(l->items, l->n, sizeof(char *), strlist_cmp);
+}
+
+static void strlist_free(StrList *l) {
+    for (size_t i = 0; i < l->n; i++) free(l->items[i]);
+    free(l->items);
+    l->items = NULL;
+    l->n = l->cap = 0;
+}
+
+/* 参照实现：opendir/readdir + lstat，与新 walk 同款过滤。 */
+static void ref_fallback_walk(const char *dir, const char *rel, uint64_t min_size,
+                              const char *const *skip_top, size_t n_skip,
+                              int is_top, StrList *out) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) return;
+    while ((e = readdir(d)) != NULL) {
+        char full[PATH_MAX], rpath[PATH_MAX];
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (e->d_name[0] == '$') continue;
+        snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+        if (rel[0] == '\0')
+            snprintf(rpath, sizeof rpath, "%s", e->d_name);
+        else
+            snprintf(rpath, sizeof rpath, "%s/%s", rel, e->d_name);
+        if (lstat(full, &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) {
+            int skip = 0;
+            if (is_top) {
+                for (size_t i = 0; i < n_skip; i++)
+                    if (strcasecmp(e->d_name, skip_top[i]) == 0) skip = 1;
+            }
+            if (!skip)
+                ref_fallback_walk(full, rpath, min_size, skip_top, n_skip, 0, out);
+            continue;
+        }
+        if (S_ISREG(st.st_mode) && (uint64_t)st.st_size >= min_size) {
+            char line[PATH_MAX + 64];
+            snprintf(line, sizeof line, "%s|%llu|%llu", rpath,
+                     (unsigned long long)st.st_size,
+                     (unsigned long long)st.st_mtime);
+            strlist_push(out, line);
+        }
+    }
+    closedir(d);
+}
+
+static void check_walk_matches(const char *root, uint64_t min_size,
+                               const char *const *skip_top, size_t n_skip,
+                               size_t want_n, const char *what) {
+    CdcFileEntryList got;
+    StrList ref, got_s;
+    memset(&got, 0, sizeof got);
+    memset(&ref, 0, sizeof ref);
+    memset(&got_s, 0, sizeof got_s);
+    CHECK_INT(cdc_fallback_walk_files(root, min_size, skip_top, n_skip, &got), 0, what);
+    ref_fallback_walk(root, "", min_size, skip_top, n_skip, 1, &ref);
+    for (size_t i = 0; i < got.n; i++) {
+        char line[PATH_MAX + 64];
+        const char *rel = got.items[i].path + strlen(root) + 1;
+        snprintf(line, sizeof line, "%s|%llu|%llu", rel,
+                 (unsigned long long)got.items[i].size,
+                 (unsigned long long)got.items[i].mtime);
+        strlist_push(&got_s, line);
+    }
+    strlist_sort(&ref);
+    strlist_sort(&got_s);
+    CHECK_U64(got_s.n, want_n, what);
+    CHECK_U64(got_s.n, ref.n, what);
+    for (size_t i = 0; i < got_s.n && i < ref.n; i++)
+        CHECK_STREQ(got_s.items[i], ref.items[i], what);
+    strlist_free(&ref);
+    strlist_free(&got_s);
+    cdc_file_entry_list_free(&got);
+}
+
+static void test_fallback_walk(void) {
+    printf("== fallback walk ==\n");
+    char root_tmpl[] = "/tmp/cdc-test-walk-XXXXXX";
+    char *root = mkdtemp(root_tmpl);
+    char p[PATH_MAX], q[PATH_MAX];
+    if (!root) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    /* 树：文件、空文件、子目录、中文名、$ 名、链接、skip_top（顶层/子层同名）。 */
+    join_path(p, sizeof p, root, "top.bin");
+    write_repeat(p, 100, 'A');
+    join_path(p, sizeof p, root, "empty.bin");
+    write_repeat(p, 0, 'A');
+    join_path(p, sizeof p, root, "a");
+    mkdir(p, 0755);
+    join_path(p, sizeof p, root, "a/mid.bin");
+    write_repeat(p, 200, 'B');
+    join_path(p, sizeof p, root, "a/b");
+    mkdir(p, 0755);
+    join_path(p, sizeof p, root, "a/b/deep.bin");
+    write_repeat(p, 300, 'C');
+    join_path(p, sizeof p, root, "$skip.bin");
+    write_repeat(p, 400, 'D');
+    join_path(p, sizeof p, root, "中文.bin");
+    write_repeat(p, 50, 'E');
+    join_path(p, sizeof p, root, "link_file");
+    { int sr = symlink("top.bin", p); (void)sr; }
+    join_path(p, sizeof p, root, "link_dir");
+    { int sr = symlink("a", p); (void)sr; }
+    join_path(p, sizeof p, root, "link_dangling");
+    { int sr = symlink("no-such-target", p); (void)sr; }
+    join_path(p, sizeof p, root, "SkipMe");
+    mkdir(p, 0755);
+    join_path(p, sizeof p, root, "SkipMe/inner.bin");
+    write_repeat(p, 500, 'F');
+    join_path(p, sizeof p, root, "a/SkipMe");
+    mkdir(p, 0755);
+    join_path(p, sizeof p, root, "a/SkipMe/nested.bin");
+    write_repeat(p, 600, 'G');
+    join_path(p, sizeof p, root, "emptydir");
+    mkdir(p, 0755);
+
+    /* skip_top 用大写 SKIPME：验证大小写不敏感匹配。 */
+    static const char *skip_top[] = { "SKIPME" };
+    check_walk_matches(root, 0, skip_top, 1, 6, "walk min_size=0");
+    check_walk_matches(root, 250, skip_top, 1, 2, "walk min_size=250");
+    /* 无 skip_top：SkipMe/inner.bin 也进来（6+1=7）。 */
+    check_walk_matches(root, 0, NULL, 0, 7, "walk no skip_top");
+    /* 缺失目录：打不开静默跳过，返回 0、空集。 */
+    {
+        CdcFileEntryList out;
+        memset(&out, 0, sizeof out);
+        join_path(q, sizeof q, root, "no-such-dir");
+        CHECK_INT(cdc_fallback_walk_files(q, 0, skip_top, 1, &out), 0, "walk missing dir");
+        CHECK_U64(out.n, 0, "walk missing dir empty");
+        cdc_file_entry_list_free(&out);
+    }
+    printf("fallback walk done\n");
+}
 
 int main(int argc, char **argv) {
     const char *fixtures = argc > 1 ? argv[1] : "tests/fixtures";
@@ -1036,7 +1536,13 @@ int main(int argc, char **argv) {
     test_fastio();
     test_scan_big(fixtures);
     test_scan_dups();
+    test_scan_dups_fixtures(fixtures);
     test_hash_groups();
+    test_fallback_walk();
+    test_par();
+    test_par_dups();
+    test_sampling();
+    test_hashcache_xxh_compat();
     printf("test_scan: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

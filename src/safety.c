@@ -1345,139 +1345,80 @@ int cdc_explicit_delete_forbidden(const char *path) {
 
 /* ---------------- 目录遍历 ---------------- */
 
+/* 递归目录遍历（单一实现，走 util.c 的 cdc_enum_dir）：Windows 用
+ * NtQueryDirectoryFile 批量取，POSIX 用 opendir/readdir。
+ * 语义与旧的两份实现一致：不跟随链接、回调失败即停、子目录递归
+ * 与 min_depth 门限无关（门限只管回调）；打不开的目录按 err 报告。
+ * 两处有意的统一：
+ *  - 缺失目录：旧 Windows 版 FindFirstFileW 拿 ERROR_FILE_NOT_FOUND
+ *    当空目录返回 OK，POSIX 版返回 NOT_FOUND；新实现两平台都返回
+ *    NOT_FOUND（调用方要么忽略返回值、要么把失败按空目录处理，
+ *    见 shred.c，故无行为变化）。
+ *  - 名字解码：旧 Windows 版遇孤立代理对返回 UTF8 错、中断整棵遍历；
+ *    新实现按 U+FFFD 替换后继续（与 cdc_wide_to_utf8 同策略）。 */
+static int walk_dir_rec(const char *dir, int depth, int min_depth,
+                        cdc_walk_fn fn, void *ctx, cdc_err_t *err);
+
+typedef struct {
+    const char *dir;
+    int depth;
+    int min_depth;
+    cdc_walk_fn fn;
+    void *ctx;
+    cdc_err_t *err;
+} WalkDirCtx;
+
+static int walk_enum_cb(const char *name, int is_dir, int is_symlink, uint64_t size,
+                        uint64_t mtime, uint32_t attrs, void *ctx) {
+    WalkDirCtx *c = (WalkDirCtx *)ctx;
+    char *full;
+    int rc = CDC_OK;
+    size_t dn = strlen(c->dir);
+    int trailing = dn > 0 && (c->dir[dn - 1] == '\\' || c->dir[dn - 1] == '/');
+    size_t fn_len = dn + (trailing ? 0 : 1) + strlen(name) + 1;
+    full = (char *)malloc(fn_len);
+    if (!full) return CDC_ERR_NOMEM;
 #ifdef _WIN32
-static int walk_dir_rec(const char *dir, int depth, int min_depth,
-                        cdc_walk_fn fn, void *ctx, cdc_err_t *err) {
-    size_t dn = strlen(dir);
-    int trailing_bs = dn > 0 && dir[dn - 1] == '\\';
-    size_t pn = dn + (trailing_bs ? 1 : 2) + 1;
-    char *pattern = (char *)malloc(pn);
-    if (!pattern) {
-        if (err) cdc_err_set(err, CDC_ERR_NOMEM, "out of memory");
-        return CDC_ERR_NOMEM;
-    }
-    snprintf(pattern, pn, trailing_bs ? "%s*" : "%s\\*", dir);
-    wchar_t *wpattern = cdc_utf8_to_wide(pattern);
-    free(pattern);
-    if (!wpattern) {
-        if (err) cdc_err_set(err, CDC_ERR_UTF8, "invalid UTF-8 path: %s", dir);
-        return CDC_ERR_UTF8;
-    }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(wpattern, &fd);
-    free(wpattern);
-    if (h == INVALID_HANDLE_VALUE) {
-        DWORD code = GetLastError();
-        if (code == ERROR_FILE_NOT_FOUND) return CDC_OK; /* 空目录 */
-        if (code == ERROR_PATH_NOT_FOUND || code == ERROR_FILE_NOT_FOUND) {
-            if (err)
-                cdc_err_set(err, CDC_ERR_NOT_FOUND, "directory not found: %s",
-                            dir);
-            return CDC_ERR_NOT_FOUND;
-        }
-        if (err)
-            cdc_err_set(err, CDC_ERR_IO, "FindFirstFileW failed (%lu): %s",
-                        (unsigned long)code, dir);
-        return CDC_ERR_IO;
-    }
-    int rc = CDC_OK;
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 ||
-            wcscmp(fd.cFileName, L"..") == 0)
-            continue;
-        char *name = cdc_wide_to_utf8(fd.cFileName);
-        if (!name) {
-            rc = CDC_ERR_UTF8;
-            break;
-        }
-        size_t fn_len = dn + (trailing_bs ? 0 : 1) + strlen(name) + 1;
-        char *full = (char *)malloc(fn_len);
-        if (!full) {
-            free(name);
-            rc = CDC_ERR_NOMEM;
-            break;
-        }
-        snprintf(full, fn_len, trailing_bs ? "%s%s" : "%s\\%s", dir, name);
-        free(name);
-        DWORD attrs = fd.dwFileAttributes;
-        int is_symlink = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-        int is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        uint64_t size = 0;
-        if (!is_dir)
-            size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        uint64_t ft = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) |
-                      fd.ftLastWriteTime.dwLowDateTime;
-        uint64_t mtime = mft_filetime_to_unix(ft);
-        if (depth >= min_depth) {
-            rc = fn(ctx, full, is_dir, is_symlink, size, mtime, attrs);
-            if (rc != 0) {
-                free(full);
-                break;
-            }
-        }
-        if (is_dir && !is_symlink)
-            rc = walk_dir_rec(full, depth + 1, min_depth, fn, ctx, err);
-        free(full);
-        if (rc != 0) break;
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return rc;
-}
+    snprintf(full, fn_len, trailing ? "%s%s" : "%s\\%s", c->dir, name);
 #else
-static int walk_dir_rec(const char *dir, int depth, int min_depth,
-                        cdc_walk_fn fn, void *ctx, cdc_err_t *err) {
-    DIR *d = opendir(dir);
-    if (!d) {
-        if (errno == ENOENT) {
-            if (err)
-                cdc_err_set(err, CDC_ERR_NOT_FOUND, "directory not found: %s",
-                            dir);
-            return CDC_ERR_NOT_FOUND;
-        }
-        if (err) cdc_err_set(err, CDC_ERR_IO, "opendir failed: %s", dir);
-        return CDC_ERR_IO;
-    }
-    int rc = CDC_OK;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-        size_t dn = strlen(dir);
-        int trailing_slash = dn > 0 && dir[dn - 1] == '/';
-        size_t fn_len = dn + (trailing_slash ? 0 : 1) + strlen(ent->d_name) + 1;
-        char *full = (char *)malloc(fn_len);
-        if (!full) {
-            rc = CDC_ERR_NOMEM;
-            break;
-        }
-        snprintf(full, fn_len, trailing_slash ? "%s%s" : "%s/%s", dir,
-                 ent->d_name);
-        struct stat st;
-        if (lstat(full, &st) != 0) {
+    snprintf(full, fn_len, trailing ? "%s%s" : "%s/%s", c->dir, name);
+#endif
+    if (c->depth >= c->min_depth) {
+        rc = c->fn(c->ctx, full, is_dir, is_symlink, size, mtime, attrs);
+        if (rc != 0) {
             free(full);
-            continue;
+            return rc;
         }
-        int is_symlink = S_ISLNK(st.st_mode) ? 1 : 0;
-        int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
-        uint64_t size = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
-        uint64_t mtime = (uint64_t)st.st_mtime;
-        if (depth >= min_depth) {
-            rc = fn(ctx, full, is_dir, is_symlink, size, mtime,
-                    (uint32_t)st.st_mode);
-            if (rc != 0) {
-                free(full);
-                break;
-            }
-        }
-        if (is_dir && !is_symlink)
-            rc = walk_dir_rec(full, depth + 1, min_depth, fn, ctx, err);
-        free(full);
-        if (rc != 0) break;
     }
-    closedir(d);
+    if (is_dir && !is_symlink)
+        rc = walk_dir_rec(full, c->depth + 1, c->min_depth, c->fn, c->ctx, c->err);
+    free(full);
     return rc;
 }
-#endif
+
+static int walk_dir_rec(const char *dir, int depth, int min_depth,
+                        cdc_walk_fn fn, void *ctx, cdc_err_t *err) {
+    WalkDirCtx c;
+    int rc;
+    c.dir = dir;
+    c.depth = depth;
+    c.min_depth = min_depth;
+    c.fn = fn;
+    c.ctx = ctx;
+    c.err = err;
+    rc = cdc_enum_dir(dir, walk_enum_cb, &c);
+    if (rc == CDC_ERR_NOT_FOUND) {
+        if (err)
+            cdc_err_set(err, CDC_ERR_NOT_FOUND, "directory not found: %s", dir);
+        return CDC_ERR_NOT_FOUND;
+    }
+    if (rc == CDC_ERR_IO) {
+        if (err)
+            cdc_err_set(err, CDC_ERR_IO, "directory enumeration failed: %s", dir);
+        return CDC_ERR_IO;
+    }
+    return rc;
+}
 
 int cdc_walk_dir(const char *root, int min_depth, cdc_walk_fn fn, void *ctx,
                  cdc_err_t *err) {

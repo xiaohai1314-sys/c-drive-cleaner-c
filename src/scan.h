@@ -4,8 +4,13 @@
  * 边界（与 Rust 版的有意差别，见 ARCHITECTURE.md）：
  *   - 索引优先（fileindex 查询）与 5 分钟 dups-*.json 缓存不在这里，
  *     属于调用方/CLI 层（切片 4）；这里只做纯实时扫描。
- *   - Rust 的并行（Rayon、每盘线程、双缓冲全哈希）在 C 版是顺序执行，
- *     结果一致，速度低一些。
+ *   - 并行：各哈希阶段（sample/strong/probe/full）与 Linux 的
+ *     IOCP 等价路径用 fastio.c 的 cdc_par_for 按文件并行
+ *     （生产者/消费者：主线程产下标、worker 消费；读与哈希
+ *     在不同 worker 上重叠）；SSD/HDD 分档定 worker 数。
+ *     结果与顺序版一致（分组前都按 (size, 摘要) 排序）。
+ *   - 全哈希仍是单缓冲循环（≥16MB 用 2MB 缓冲）；单文件内
+ *     再开读线程的收益很小，暂不做。
  *   - 取消：Rust 用全局 DUP_CANCEL + scan 取消标志；C 版用 opts->cancel
  *    （调用方随时置 1），各阶段边界检查，取消后返回空结果。
  */
@@ -26,6 +31,10 @@
 #define CDC_SCAN_PROBE_THRESHOLD ((uint64_t)16 * 1024 * 1024)
 #define CDC_SCAN_HDD_SEQ_THRESHOLD ((uint64_t)2 * 1024 * 1024)
 #define CDC_SCAN_FULL_BUF_SIZE ((size_t)1024 * 1024)
+/* ≥16MB 文件的全哈希改用 2MB 缓冲（与 Rust 的双缓冲分支同一档位；
+ * C 版仍是单缓冲循环，大缓冲减少 read 调用次数）。 */
+#define CDC_SCAN_FULL_BUF_LARGE ((size_t)2 * 1024 * 1024)
+#define CDC_SCAN_FULL_LARGE_THRESHOLD ((uint64_t)16 * 1024 * 1024)
 
 /* ---------------- 大文件 ---------------- */
 
@@ -126,6 +135,6 @@ uint64_t cdc_file_mtime(const char *path);
 /* 固定盘符列表（Windows：GetLogicalDrives + GetDriveTypeW==3；
  * 空时返回 C:\；Linux：返回 0 条）。drives 为调用方提供的
  * [cap][4] 缓冲（"C:\\" 形）。返回 0 成功。 */
-int cdc_fixed_drives(char (*drives)[4], size_t cap, size_t *out_n);
+int cdc_fixed_drives_buf(char (*drives)[4], size_t cap, size_t *out_n);
 
 #endif

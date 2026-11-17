@@ -52,6 +52,9 @@ static const char *SCHEMA_SQL =
     "    sample BLOB,"
     "    strong BLOB,"
     "    full BLOB,"
+    "    head_xxh INTEGER,"
+    "    sample_xxh INTEGER,"
+    "    strong_xxh INTEGER,"
     "    last_seen INTEGER NOT NULL,"
     "    PRIMARY KEY (volume_serial, frn)"
     ") WITHOUT ROWID;"
@@ -154,6 +157,27 @@ cdc_fileindex_t *cdc_fileindex_open(const char *db_path, cdc_err_t *err) {
         free(idx);
         return NULL;
     }
+    /* 旧库补列：files 表可能是 Rust 版或旧版 C 建的（无 xxh 三列），
+     * CREATE TABLE IF NOT EXISTS 不会补新列，这里按需 ALTER。 */
+    static const char *XXH_COLS[3] = {"head_xxh", "sample_xxh", "strong_xxh"};
+    for (int i = 0; i < 3; i++) {
+        sqlite3_stmt *ck = NULL;
+        char sql[128];
+        snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM pragma_table_info('files')"
+                                  " WHERE name = '%s'",
+                 XXH_COLS[i]);
+        int has = 0;
+        if (sqlite3_prepare_v2(idx->db, sql, -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW)
+                has = sqlite3_column_int(ck, 0) > 0;
+            sqlite3_finalize(ck);
+        }
+        if (!has) {
+            snprintf(sql, sizeof sql, "ALTER TABLE files ADD COLUMN %s INTEGER",
+                     XXH_COLS[i]);
+            sqlite3_exec(idx->db, sql, NULL, NULL, NULL); /* 失败忽略：下次打开再试 */
+        }
+    }
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(idx->db,
                            "INSERT OR IGNORE INTO index_meta (key, value) "
@@ -202,8 +226,8 @@ size_t cdc_fileindex_upsert_files(cdc_fileindex_t *idx,
     if (!idx || n == 0) return 0;
     static const char *SQL =
         "INSERT INTO files"
-        " (volume_serial, frn, path, size, mtime, head, sample, strong, full, last_seen)"
-        " VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, ?6)"
+        " (volume_serial, frn, path, size, mtime, head, sample, strong, full, head_xxh, sample_xxh, strong_xxh, last_seen)"
+        " VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?6)"
         " ON CONFLICT(volume_serial, frn) DO UPDATE SET"
         "     path = excluded.path,"
         "     size = excluded.size,"
@@ -212,6 +236,9 @@ size_t cdc_fileindex_upsert_files(cdc_fileindex_t *idx,
         "     sample = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.sample END,"
         "     strong = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.strong END,"
         "     full = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.full END,"
+        "     head_xxh = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.head_xxh END,"
+        "     sample_xxh = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.sample_xxh END,"
+        "     strong_xxh = CASE WHEN files.size <> excluded.size OR files.mtime <> excluded.mtime THEN NULL ELSE files.strong_xxh END,"
         "     last_seen = excluded.last_seen";
     char *emsg = NULL;
     if (sqlite3_exec(idx->db, "BEGIN IMMEDIATE", NULL, NULL, &emsg) != SQLITE_OK) {
@@ -252,6 +279,15 @@ static void bind_digest_or_null(sqlite3_stmt *st, int col, int has,
     }
 }
 
+/* XXH3-64 按位存 INTEGER；没有时绑 NULL（不覆盖已有值）。 */
+static void bind_xxh_or_null(sqlite3_stmt *st, int col, int has, uint64_t v) {
+    if (has) {
+        sqlite3_bind_int64(st, col, (sqlite3_int64)v);
+    } else {
+        sqlite3_bind_null(st, col);
+    }
+}
+
 size_t cdc_fileindex_set_digests_batch(cdc_fileindex_t *idx,
                                        const cdc_digest_update_t *updates, size_t n,
                                        uint64_t now_secs) {
@@ -262,7 +298,10 @@ size_t cdc_fileindex_set_digests_batch(cdc_fileindex_t *idx,
         "     sample = COALESCE(?6, sample),"
         "     strong = COALESCE(?7, strong),"
         "     full = COALESCE(?8, full),"
-        "     last_seen = ?9"
+        "     head_xxh = COALESCE(?9, head_xxh),"
+        "     sample_xxh = COALESCE(?10, sample_xxh),"
+        "     strong_xxh = COALESCE(?11, strong_xxh),"
+        "     last_seen = ?12"
         " WHERE volume_serial = ?1 AND frn = ?2 AND size = ?3 AND mtime = ?4";
     char *emsg = NULL;
     if (sqlite3_exec(idx->db, "BEGIN IMMEDIATE", NULL, NULL, &emsg) != SQLITE_OK) {
@@ -286,7 +325,13 @@ size_t cdc_fileindex_set_digests_batch(cdc_fileindex_t *idx,
         bind_digest_or_null(st, 6, updates[i].digests.has_sample, &updates[i].digests.sample);
         bind_digest_or_null(st, 7, updates[i].digests.has_strong, &updates[i].digests.strong);
         bind_digest_or_null(st, 8, updates[i].digests.has_full, &updates[i].digests.full);
-        sqlite3_bind_int64(st, 9, to_i64(now_secs));
+        bind_xxh_or_null(st, 9, updates[i].digests.has_head_xxh,
+                         updates[i].digests.head_xxh);
+        bind_xxh_or_null(st, 10, updates[i].digests.has_sample_xxh,
+                         updates[i].digests.sample_xxh);
+        bind_xxh_or_null(st, 11, updates[i].digests.has_strong_xxh,
+                         updates[i].digests.strong_xxh);
+        sqlite3_bind_int64(st, 12, to_i64(now_secs));
         if (sqlite3_step(st) == SQLITE_DONE) updated += (size_t)sqlite3_changes(idx->db);
     }
     sqlite3_finalize(st);
@@ -454,6 +499,14 @@ static void read_digest(sqlite3_stmt *st, int col, int *has, cdc_digest_t *d) {
     }
 }
 
+/* 从一列读 XXH3-64：INTEGER 列按位还原 uint64；NULL 视为没有。 */
+static void read_xxh(sqlite3_stmt *st, int col, int *has, uint64_t *v) {
+    *has = 0;
+    if (sqlite3_column_type(st, col) != SQLITE_INTEGER) return;
+    *v = (uint64_t)sqlite3_column_int64(st, col);
+    *has = 1;
+}
+
 static char *dup_text(sqlite3_stmt *st, int col) {
     const unsigned char *t = sqlite3_column_text(st, col);
     return strdup(t ? (const char *)t : "");
@@ -469,7 +522,8 @@ cdc_index_hash_row_t *cdc_fileindex_rows_needing_full(cdc_fileindex_t *idx,
     if (out_n) *out_n = 0;
     if (!idx) return NULL;
     static const char *SQL =
-        "SELECT frn, path, size, mtime, head, sample, strong, full"
+        "SELECT frn, path, size, mtime, head, sample, strong, full,"
+        " head_xxh, sample_xxh, strong_xxh"
         " FROM files"
         " WHERE volume_serial = ?1 AND size IN ("
         "     SELECT size FROM files WHERE volume_serial = ?1"
@@ -495,6 +549,9 @@ cdc_index_hash_row_t *cdc_fileindex_rows_needing_full(cdc_fileindex_t *idx,
         read_digest(st, 5, &r.digests.has_sample, &r.digests.sample);
         read_digest(st, 6, &r.digests.has_strong, &r.digests.strong);
         read_digest(st, 7, &r.digests.has_full, &r.digests.full);
+        read_xxh(st, 8, &r.digests.has_head_xxh, &r.digests.head_xxh);
+        read_xxh(st, 9, &r.digests.has_sample_xxh, &r.digests.sample_xxh);
+        read_xxh(st, 10, &r.digests.has_strong_xxh, &r.digests.strong_xxh);
         if (!r.path || cdc_vec_push(&v, &r) != CDC_OK) {
             free(r.path);
             break;
@@ -512,6 +569,44 @@ void cdc_index_hash_rows_free(cdc_index_hash_row_t *rows, size_t n) {
     if (!rows) return;
     for (size_t i = 0; i < n; i++) free(rows[i].path);
     free(rows);
+}
+
+cdc_index_digest_entry_t *cdc_fileindex_all_digests(cdc_fileindex_t *idx,
+                                                    uint64_t volume_serial,
+                                                    size_t *out_n) {
+    if (out_n) *out_n = 0;
+    if (!idx) return NULL;
+    static const char *SQL =
+        "SELECT frn, head, sample, strong, full"
+        " FROM files"
+        " WHERE volume_serial = ?1"
+        "   AND (head IS NOT NULL OR sample IS NOT NULL"
+        "        OR strong IS NOT NULL OR full IS NOT NULL)"
+        " ORDER BY frn";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(idx->db, SQL, -1, &st, NULL) != SQLITE_OK) return NULL;
+    sqlite3_bind_int64(st, 1, to_i64(volume_serial));
+    cdc_vec_t v;
+    if (cdc_vec_init(&v, sizeof(cdc_index_digest_entry_t)) != CDC_OK) {
+        sqlite3_finalize(st);
+        return NULL;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        cdc_index_digest_entry_t e;
+        memset(&e, 0, sizeof(e));
+        e.frn = col_u64(st, 0);
+        read_digest(st, 1, &e.digests.has_head, &e.digests.head);
+        read_digest(st, 2, &e.digests.has_sample, &e.digests.sample);
+        read_digest(st, 3, &e.digests.has_strong, &e.digests.strong);
+        read_digest(st, 4, &e.digests.has_full, &e.digests.full);
+        if (cdc_vec_push(&v, &e) != CDC_OK) break;
+    }
+    sqlite3_finalize(st);
+    if (out_n) *out_n = v.len;
+    cdc_index_digest_entry_t *arr = v.data;
+    v.data = NULL; /* 交出所有权：无 owned 指针，调用方直接 free() */
+    cdc_vec_free(&v);
+    return arr;
 }
 
 static int count_query(cdc_fileindex_t *idx, const char *sql, uint64_t serial,
@@ -591,7 +686,8 @@ cdc_index_dup_row_t *cdc_fileindex_query_dup_rows(cdc_fileindex_t *idx,
     if (!ph) return NULL;
     /* SQL 模板与 Rust 版一致（IN 列表出现两次：外层与子查询）。 */
     const char *tmpl =
-        "SELECT volume_serial, frn, path, size, mtime, head, sample, strong, full"
+        "SELECT volume_serial, frn, path, size, mtime, head, sample, strong, full,"
+        " head_xxh, sample_xxh, strong_xxh"
         " FROM files"
         " WHERE volume_serial IN (%s) AND size >= ? AND size IN ("
         "     SELECT size FROM files WHERE volume_serial IN (%s)"
@@ -635,6 +731,9 @@ cdc_index_dup_row_t *cdc_fileindex_query_dup_rows(cdc_fileindex_t *idx,
         read_digest(st, 6, &r.digests.has_sample, &r.digests.sample);
         read_digest(st, 7, &r.digests.has_strong, &r.digests.strong);
         read_digest(st, 8, &r.digests.has_full, &r.digests.full);
+        read_xxh(st, 9, &r.digests.has_head_xxh, &r.digests.head_xxh);
+        read_xxh(st, 10, &r.digests.has_sample_xxh, &r.digests.sample_xxh);
+        read_xxh(st, 11, &r.digests.has_strong_xxh, &r.digests.strong_xxh);
         if (!r.path || cdc_vec_push(&v, &r) != CDC_OK) {
             free(r.path);
             break;
@@ -940,6 +1039,75 @@ static void test_needing_full_groups(void) {
     cdc_fileindex_close(idx);
 }
 
+static void test_all_digests(void) {
+    char db[4096];
+    if (fi_tmp_db(db, sizeof(db)) != 0) {
+        FI_CHECK(0, "tmp db path");
+        return;
+    }
+    cdc_fileindex_t *idx = cdc_fileindex_open(db, NULL);
+    FI_CHECK(idx != NULL, "open db");
+    if (!idx) return;
+    cdc_index_row_t rows[] = {
+        irow(11, 100, "C:\\a.bin", 4096, 111),
+        irow(11, 101, "C:\\b.bin", 4096, 222),
+        irow(11, 102, "C:\\c.bin", 4096, 333),
+        irow(22, 200, "D:\\a.bin", 4096, 111),
+    };
+    FI_CHECK(cdc_fileindex_upsert_files(idx, rows, 4) == 4, "upsert 4");
+    /* 100：full + head；101：只有 sample；102：无摘要；200（另一卷）：full。 */
+    cdc_digest_update_t u1 = upd(11, 100, 4096, 111, 1, 2);
+    u1.digests.has_head = 1;
+    u1.digests.head = dig(1);
+    FI_CHECK(cdc_fileindex_set_digests_batch(idx, &u1, 1, 1000) == 1, "digest 100");
+    cdc_digest_update_t u2;
+    memset(&u2, 0, sizeof(u2));
+    u2.volume_serial = 11;
+    u2.frn = 101;
+    u2.size = 4096;
+    u2.mtime = 222;
+    u2.digests.has_sample = 1;
+    u2.digests.sample = dig(5);
+    FI_CHECK(cdc_fileindex_set_digests_batch(idx, &u2, 1, 1000) == 1, "digest 101 sample");
+    cdc_digest_update_t u3 = upd(22, 200, 4096, 111, 1, 7);
+    FI_CHECK(cdc_fileindex_set_digests_batch(idx, &u3, 1, 1000) == 1, "digest 200");
+    size_t n = 0;
+    cdc_index_digest_entry_t *all = cdc_fileindex_all_digests(idx, 11, &n);
+    FI_CHECK(n == 2, "all_digests vol 11 has 2, got %zu", n);
+    FI_CHECK(n == 2 && all[0].frn == 100 && all[1].frn == 101, "all_digests sorted by frn");
+    FI_CHECK(n == 2 && all[0].digests.has_full && all[0].digests.has_head,
+             "all_digests 100 full+head");
+    FI_CHECK(n == 2 && !all[0].digests.has_sample && !all[0].digests.has_strong,
+             "all_digests 100 no sample/strong");
+    FI_CHECK(n == 2 && all[1].digests.has_sample && !all[1].digests.has_full,
+             "all_digests 101 sample only");
+    FI_CHECK(n == 2 && memcmp(all[0].digests.full.bytes, dig(2).bytes, 32) == 0,
+             "all_digests 100 full bytes exact");
+    free(all);
+    /* 改名（同 frn、同 size/mtime）：摘要仍在。 */
+    cdc_index_row_t renamed = irow(11, 100, "C:\\a-renamed.bin", 4096, 111);
+    FI_CHECK(cdc_fileindex_upsert_files(idx, &renamed, 1) == 1, "upsert rename 100");
+    all = cdc_fileindex_all_digests(idx, 11, &n);
+    FI_CHECK(n == 2 && all[0].frn == 100 && all[0].digests.has_full,
+             "all_digests rename keeps full");
+    free(all);
+    /* 内容变了（size 变化）：摘要清掉，不再返回。 */
+    cdc_index_row_t changed = irow(11, 101, "C:\\b.bin", 8192, 222);
+    FI_CHECK(cdc_fileindex_upsert_files(idx, &changed, 1) == 1, "upsert changed 101");
+    all = cdc_fileindex_all_digests(idx, 11, &n);
+    FI_CHECK(n == 1 && all[0].frn == 100, "all_digests changed row dropped");
+    free(all);
+    /* 另一卷 / 空卷隔离。 */
+    all = cdc_fileindex_all_digests(idx, 22, &n);
+    FI_CHECK(n == 1 && all[0].frn == 200 && all[0].digests.has_full,
+             "all_digests vol 22 separate");
+    free(all);
+    all = cdc_fileindex_all_digests(idx, 99, &n);
+    FI_CHECK(n == 0, "all_digests empty volume");
+    free(all);
+    cdc_fileindex_close(idx);
+}
+
 static void test_delete_volume(void) {
     char db[4096];
     if (fi_tmp_db(db, sizeof(db)) != 0) {
@@ -1084,6 +1252,7 @@ int cdc_fileindex_selftest(void) {
     test_roundtrip();
     test_delete_and_prefix();
     test_needing_full_groups();
+    test_all_digests();
     test_delete_volume();
     test_query_dup_rows();
     test_query_big_rows();

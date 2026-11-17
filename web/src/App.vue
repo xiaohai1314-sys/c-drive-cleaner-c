@@ -1,20 +1,36 @@
 <script setup lang="ts">
-import { computed, onMounted, watchEffect, type Component } from "vue";
+import {
+  computed,
+  defineAsyncComponent,
+  onMounted,
+  watchEffect,
+  type Component,
+} from "vue";
 import AppSidebar from "./components/AppSidebar.vue";
 import WindowBar from "./components/WindowBar.vue";
 import TaskDock from "./components/TaskDock.vue";
 import ToastHost from "./components/ToastHost.vue";
 import ModalHost from "./components/ModalHost.vue";
 import HistoryModal from "./components/HistoryModal.vue";
-import CleanPage from "./pages/CleanPage.vue";
-import SystemPage from "./pages/SystemPage.vue";
-import FragPage from "./pages/FragPage.vue";
-import PrivacyPage from "./pages/PrivacyPage.vue";
-import BigPage from "./pages/BigPage.vue";
-import DupPage from "./pages/DupPage.vue";
-import WechatPage from "./pages/WechatPage.vue";
-import QqPage from "./pages/QqPage.vue";
-import ShredPage from "./pages/ShredPage.vue";
+// 9 个页面按需加载：首屏只加载当前页（默认 clean），切页时再加载对应
+// chunk。AppSidebar/WindowBar 等常驻组件保持静态 import。
+const CleanPage = defineAsyncComponent(() => import("./pages/CleanPage.vue"));
+const SystemPage = defineAsyncComponent(
+  () => import("./pages/SystemPage.vue"),
+);
+const FragPage = defineAsyncComponent(() => import("./pages/FragPage.vue"));
+const PrivacyPage = defineAsyncComponent(
+  () => import("./pages/PrivacyPage.vue"),
+);
+const BigPage = defineAsyncComponent(() => import("./pages/BigPage.vue"));
+const DupPage = defineAsyncComponent(() => import("./pages/DupPage.vue"));
+const WechatPage = defineAsyncComponent(
+  () => import("./pages/WechatPage.vue"),
+);
+const QqPage = defineAsyncComponent(() => import("./pages/QqPage.vue"));
+const ShredPage = defineAsyncComponent(
+  () => import("./pages/ShredPage.vue"),
+);
 import { currentPage, loadDisk, loadDrives, setNavSize, type PageKey } from "./stores/app";
 import { bigRows } from "./stores/big";
 import { categories, selected } from "./stores/clean";

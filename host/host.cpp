@@ -1,9 +1,11 @@
 // cdc_host.cpp — WebView2 宿主外壳（切片 5）。
 //
-// 职责：建窗口 → 起 WebView2 → 把 dist/ 以 https://cdc.local/ 映射出去 →
-// 接桥（bridge.cpp）→ 跑消息循环。业务命令的注册不在此处：
-// src/main.c（GUI 入口）在调 cdc_host_run() 之前先完成后端初始化并
-// cdc_bridge_register() 全部后端命令；window_* 三个宿主命令由本文件注册。
+// 职责：预热 WebView2 环境（cdc_host_prewarm）→ 建窗口 → 起控制器 →
+// 把 dist/ 以 https://cdc.local/ 映射出去 → 接桥（bridge.cpp）→
+// 跑消息循环。业务命令的注册不在此处：
+// src/main.c（GUI 入口）在调 cdc_host_run() 之前先调 cdc_host_prewarm()、
+// 完成后端初始化并 cdc_bridge_register() 全部后端命令；
+// window_* 三个宿主命令由本文件注册。
 //
 // 为什么不用 file:// 直接加载 dist/index.html：
 // Vite 产物是 ES module 脚本，Chromium 会以 CORS 为由拦截 file:// 源的
@@ -24,11 +26,19 @@
 
 #include <WebView2.h>
 
+#ifdef __MINGW32__
+#include "mingw_uuids.h"
+#endif
+
 #include <shlwapi.h>
 #include <string.h>
 #include <wctype.h>
 #include <windows.h>
 #include <windowsx.h>
+
+// mimalloc（性能优化项 6）：只显式调 mi_*，不用 -include
+// mimalloc-override.h 的宏覆盖（C++ 翻译单元里宏覆盖会干扰标准库头文件）。
+#include "mimalloc.h"
 
 #include <new>
 #include <string>
@@ -47,8 +57,20 @@ ICoreWebView2Environment *g_env = nullptr;
 ICoreWebView2Controller *g_controller = nullptr;
 ICoreWebView2 *g_webview = nullptr;
 std::wstring g_dist_dir;  // dist/ 的绝对路径（末尾带 '\'）。
+// 预热状态：g_env_ready = 环境已就绪；g_env_creating = 环境创建进行中；
+// g_com_init_by_us = 本次 COM STA 初始化由宿主完成，退出时由宿主
+// CoUninitialize（调用方已初始化过时宿主不接管、不 CoUninitialize）。
+bool g_env_ready = false;
+bool g_env_creating = false;
+bool g_com_init_by_us = false;
 
 void resize_webview();  // 定义在后（ControllerHandler 里调用）。
+void create_controller();  // 定义在后（EnvironmentHandler 与 cdc_host_run 共用）。
+HRESULT start_environment();  // 定义在后（预热与 cdc_host_run 共用）.
+
+// COM 回调类（定义在后，start_environment / create_controller 引用）。
+class ControllerHandler;
+class EnvironmentHandler;
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -68,6 +90,35 @@ std::wstring local_app_data() {
   if (len == 0 || len >= MAX_PATH) return exe_dir();
   return std::wstring(buf, len) + L"\\";
 }
+
+// ---------------------------------------------------------------------------
+// COM 初始化与 WebView2 环境预热（优化项 5）。
+//
+// 浏览器进程拉起是启动链里最慢的一环（几百毫秒）；把它提前到后端
+// 初始化阶段，与命令注册、索引状态读取等工作重叠，首屏就能少等。
+// 环境创建是异步的：CreateCoreWebView2EnvironmentWithOptions 只排队，
+// 真正的回调在消息循环跑起来后才触发；若回调到达时窗口还没建好，
+// 控制器创建推迟到窗口建好后（g_env_ready 标志）。
+// 不做隐藏 WebView 预热渲染进程：控制器建好后立刻 Navigate，
+// 提前建一个隐藏 WebView 的收益约等于 0。
+// ---------------------------------------------------------------------------
+
+// 确保当前线程是 STA（WebView2 要求）。
+// S_OK：本次由宿主初始化，退出时由宿主 CoUninitialize；
+// S_FALSE：调用方已初始化过，宿主不接管、不 CoUninitialize；
+// RPC_E_CHANGED_MODE 或其他失败：返回失败码。
+HRESULT ensure_com_sta() {
+  HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (hr == S_OK) {
+    g_com_init_by_us = true;
+    return S_OK;
+  }
+  if (hr == S_FALSE) return S_OK;  // 调用方已初始化，本次不接管。
+  return hr;
+}
+
+// start_environment() 与 create_controller() 的定义在 EnvironmentHandler /
+// ControllerHandler 类定义之后（new 需要完整类型），声明见文件顶部。
 
 const wchar_t *content_type_for(const std::wstring &path) {
   size_t dot = path.find_last_of(L'.');
@@ -295,14 +346,17 @@ class EnvironmentHandler final
   }
   HRESULT STDMETHODCALLTYPE Invoke(
       HRESULT result, ICoreWebView2Environment *env) override {
-    if (FAILED(result) || !env) return S_OK;
+    if (FAILED(result) || !env) {
+      g_env_creating = false;
+      return S_OK;
+    }
     g_env = env;
     g_env->AddRef();
-    auto *controller = new (std::nothrow) ControllerHandler();
-    if (controller) {
-      g_env->CreateCoreWebView2Controller(g_hwnd, controller);
-      controller->Release();
-    }
+    g_env_ready = true;
+    g_env_creating = false;
+    // 预热时窗口还没建：控制器创建推迟到 cdc_host_run() 建窗后。
+    // 窗口已建好时直接创建（与原来行为一致）。
+    create_controller();
     return S_OK;
   }
 
@@ -317,6 +371,33 @@ void resize_webview() {
   g_controller->put_Bounds(bounds);
 }
 
+// 启动环境创建（异步）。已就绪或进行中时是空操作，可安全重复调用。
+HRESULT start_environment() {
+  if (g_env || g_env_creating) return S_OK;
+  g_env_creating = true;
+  std::wstring user_data = local_app_data() + L"C盘清理工具\\webview2";
+  auto *env_handler = new (std::nothrow) EnvironmentHandler();
+  if (!env_handler) {
+    g_env_creating = false;
+    return E_OUTOFMEMORY;
+  }
+  HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
+      nullptr, user_data.c_str(), nullptr, env_handler);
+  env_handler->Release();
+  if (FAILED(hr)) g_env_creating = false;
+  return hr;
+}
+
+// 在已有窗口上创建控制器（环境就绪后调用；EnvironmentHandler 回调与
+// cdc_host_run() 两处共用）。
+void create_controller() {
+  if (!g_env || !g_hwnd || g_controller) return;
+  auto *controller = new (std::nothrow) ControllerHandler();
+  if (!controller) return;
+  g_env->CreateCoreWebView2Controller(g_hwnd, controller);
+  controller->Release();
+}
+
 // ---------------------------------------------------------------------------
 // 宿主命令 window_minimize / window_maximize / window_close。
 // ---------------------------------------------------------------------------
@@ -324,7 +405,7 @@ int window_minimize(const char *args_json, char **out_json, char **out_error) {
   (void)args_json;
   (void)out_error;
   ShowWindow(g_hwnd, SW_MINIMIZE);
-  *out_json = _strdup("null");
+  *out_json = mi_strdup("null");
   return *out_json ? 0 : -1;
 }
 
@@ -332,7 +413,7 @@ int window_maximize(const char *args_json, char **out_json, char **out_error) {
   (void)args_json;
   (void)out_error;
   ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE);
-  *out_json = _strdup("null");
+  *out_json = mi_strdup("null");
   return *out_json ? 0 : -1;
 }
 
@@ -340,7 +421,7 @@ int window_close(const char *args_json, char **out_json, char **out_error) {
   (void)args_json;
   (void)out_error;
   PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-  *out_json = _strdup("null");
+  *out_json = mi_strdup("null");
   return *out_json ? 0 : -1;
 }
 
@@ -375,6 +456,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
 }  // namespace
 
+// 预热入口：尽早启动 WebView2 环境创建（异步），与后端初始化重叠。
+// main.c 在注册后端命令之前调用；环境就绪回调在消息循环跑起来后触发。
+// 返回 0 成功；非 0 为 COM 初始化失败（RPC_E_CHANGED_MODE 等）
+// 或环境创建提交失败。
+extern "C" int cdc_host_prewarm(void) {
+  if (FAILED(ensure_com_sta())) return -1;
+  return SUCCEEDED(start_environment()) ? 0 : -1;
+}
+
 // GUI 入口：main.c 在调本函数前完成后端初始化 + 命令注册。
 // 返回进程退出码。
 extern "C" int cdc_host_run(HINSTANCE instance, int cmd_show) {
@@ -383,6 +473,11 @@ extern "C" int cdc_host_run(HINSTANCE instance, int cmd_show) {
   cdc_bridge_register("window_minimize", window_minimize);
   cdc_bridge_register("window_maximize", window_maximize);
   cdc_bridge_register("window_close", window_close);
+
+  if (FAILED(ensure_com_sta())) return 1;
+  // 建窗前启动环境创建（已预热过时是空操作）；浏览器进程拉起与
+  // 窗口创建重叠，而不是等窗口出来后再开始等。
+  if (FAILED(start_environment())) return 1;
 
   const wchar_t kClass[] = L"CdcCleanerHost";
   WNDCLASSEXW wc = {};
@@ -406,13 +501,9 @@ extern "C" int cdc_host_run(HINSTANCE instance, int cmd_show) {
   ShowWindow(g_hwnd, cmd_show);
   UpdateWindow(g_hwnd);
 
-  std::wstring user_data = local_app_data() + L"C盘清理工具\\webview2";
-  auto *env_handler = new (std::nothrow) EnvironmentHandler();
-  if (!env_handler) return 1;
-  HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-      nullptr, user_data.c_str(), nullptr, env_handler);
-  env_handler->Release();
-  if (FAILED(hr)) return 1;
+  // 环境若在建窗前已就绪（预热完成），此时补建控制器；否则等
+  // EnvironmentHandler 回调到达时创建。
+  if (g_env_ready) create_controller();
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -423,5 +514,6 @@ extern "C" int cdc_host_run(HINSTANCE instance, int cmd_show) {
   if (g_webview) g_webview->Release();
   if (g_controller) g_controller->Release();
   if (g_env) g_env->Release();
+  if (g_com_init_by_us) CoUninitialize();
   return (int)msg.wParam;
 }

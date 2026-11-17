@@ -17,8 +17,11 @@
  *
  * 卷/USN/枚举接口用 mft.h（切片 2 已落地）；hashcache.c / scan.c
  * （切片 3）的接口见 hashcache.h / scan.h（真实现已落地，临时桩已删）。
- * GUI 启动、提权自启、计划任务后台重注册是 host/bridge 切片的事，
- * 不在这里（Rust main() 里 ensure_admin + 后台 register_task 的部分）。
+ * GUI 入口在 main() 默认分支（无 CLI 参数时）：先 cdc_host_prewarm()，
+ * 再 cdc_gui_register_commands() 注册 45 个后端命令，最后
+ * cdc_host_run() 跑消息循环（见 src/gui.c + host/host.cpp）。
+ * 未决事项（见 gui.c 头注释）：GUI 提权自启、计划任务后台重注册、
+ * 启动时 recover_pending_move()——Rust main() 里有，C 版尚未决定。
  */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -38,6 +41,11 @@
 #include "indextask.h"
 #include "mft.h" /* CdcFileEntry、cdc_scan_files、USN */
 #include "scan.h" /* cdc_scan_input_t、cdc_scan_hash_groups（真实现；桩已删） */
+#include "gui.h" /* cdc_gui_register_commands（GUI 入口） */
+
+#ifdef _WIN32
+#include "bridge.h" /* cdc_host_prewarm / cdc_host_run（extern "C"）；Windows 构建加 -Ihost */
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -383,7 +391,8 @@ typedef struct {
     double elapsed_secs;
 } idx_outcome_t;
 
-/* 合并两组摘要：a 优先，a 没有的用 b 补（对应 Rust 的 or_else 链）。 */
+/* 合并两组摘要：a 优先，a 没有的用 b 补（对应 Rust 的 or_else 链）。
+ * xxh 三档与 BLAKE3 四档都按同一规则合并。 */
 static void merge_digests(cdc_digest_set_t *dst, const cdc_digest_set_t *a,
                           const cdc_digest_set_t *b) {
     dst->has_head = a->has_head;
@@ -410,16 +419,48 @@ static void merge_digests(cdc_digest_set_t *dst, const cdc_digest_set_t *a,
         dst->has_full = 1;
         dst->full = b->full;
     }
+    dst->has_head_xxh = a->has_head_xxh;
+    dst->head_xxh = a->head_xxh;
+    if (!dst->has_head_xxh && b->has_head_xxh) {
+        dst->has_head_xxh = 1;
+        dst->head_xxh = b->head_xxh;
+    }
+    dst->has_sample_xxh = a->has_sample_xxh;
+    dst->sample_xxh = a->sample_xxh;
+    if (!dst->has_sample_xxh && b->has_sample_xxh) {
+        dst->has_sample_xxh = 1;
+        dst->sample_xxh = b->sample_xxh;
+    }
+    dst->has_strong_xxh = a->has_strong_xxh;
+    dst->strong_xxh = a->strong_xxh;
+    if (!dst->has_strong_xxh && b->has_strong_xxh) {
+        dst->has_strong_xxh = 1;
+        dst->strong_xxh = b->strong_xxh;
+    }
 }
 
 static int any_digest(const cdc_digest_set_t *d) {
-    return d->has_head || d->has_sample || d->has_strong || d->has_full;
+    return d->has_head || d->has_sample || d->has_strong || d->has_full ||
+           d->has_head_xxh || d->has_sample_xxh || d->has_strong_xxh;
 }
 
 /* 增量维护的哈希补算：对"同 size ≥ 2 且组内至少一个缺 full"的组跑哈希管线。
  * 摘要来源优先级：索引行已有 > file_hashes 缓存 > 管线新算；新摘要双写
  * （索引 + 缓存，缓存的写回由管线内部做）。
  * 返回（从缓存复用的 full 个数，管线新算的 full 个数）。 */
+/* idx_dig 按 frn 升序：二分查找。 */
+static const cdc_index_digest_entry_t *find_idx_digest(
+    const cdc_index_digest_entry_t *arr, size_t n, uint64_t frn) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (arr[mid].frn == frn) return &arr[mid];
+        if (arr[mid].frn < frn) lo = mid + 1;
+        else hi = mid;
+    }
+    return NULL;
+}
+
 static void hash_index_groups(cdc_fileindex_t *idx, uint64_t serial, uint64_t stamp_now,
                               uint64_t *out_reused, uint64_t *out_new) {
     *out_reused = 0;
@@ -644,26 +685,45 @@ static idx_outcome_t index_volume_backfill(cdc_fileindex_t *idx, const char *dri
         o.elapsed_secs = now_mono() - started;
         return o;
     }
+    /* 种子补充：索引里已有的摘要（见 cdc_fileindex_all_digests 注释）。
+     * upsert 已保证 size/mtime 变了的行摘要已清 NULL，读回的摘要与
+     * 当前文件一致。合并顺序与 hash_index_groups 一致：索引优先，
+     * 缓存补缺。没有缓存（cache==NULL）时索引摘要仍可复用。 */
+    size_t n_idx_dig = 0;
+    cdc_index_digest_entry_t *idx_dig =
+        cdc_fileindex_all_digests(idx, serial, &n_idx_dig);
     for (size_t i = 0; i < n_res; i++) {
-        if (!cache) break;
-        cdc_digest_set_t ce;
-        memset(&ce, 0, sizeof(ce));
-        if (cdc_hashcache_entry_for(cache, res[i].path, res[i].size, res[i].mtime,
-                                    &ce) != 1)
-            continue;
-        seeded[i] = ce;
-        if (ce.has_full) reused_full++;
-        if (any_digest(&ce)) {
-            cdc_digest_update_t u;
-            memset(&u, 0, sizeof(u));
-            u.volume_serial = serial;
-            u.frn = res[i].frn;
-            u.size = res[i].size;
-            u.mtime = res[i].mtime;
-            u.digests = ce;
-            cdc_vec_push(&reuse_v, &u);
+        cdc_digest_set_t merged;
+        memset(&merged, 0, sizeof(merged));
+        if (idx_dig) {
+            const cdc_index_digest_entry_t *e =
+                find_idx_digest(idx_dig, n_idx_dig, res[i].frn);
+            if (e) merged = e->digests;
         }
+        if (cache) {
+            cdc_digest_set_t ce;
+            memset(&ce, 0, sizeof(ce));
+            if (cdc_hashcache_entry_for(cache, res[i].path, res[i].size,
+                                        res[i].mtime, &ce) == 1) {
+                cdc_digest_set_t tmp;
+                merge_digests(&tmp, &merged, &ce);
+                merged = tmp;
+                if (any_digest(&ce)) {
+                    cdc_digest_update_t u;
+                    memset(&u, 0, sizeof(u));
+                    u.volume_serial = serial;
+                    u.frn = res[i].frn;
+                    u.size = res[i].size;
+                    u.mtime = res[i].mtime;
+                    u.digests = ce;
+                    cdc_vec_push(&reuse_v, &u);
+                }
+            }
+        }
+        seeded[i] = merged;
+        if (merged.has_full) reused_full++;
     }
+    free(idx_dig);
     if (reuse_v.len > 0) {
         cdc_fileindex_set_digests_batch(idx, reuse_v.data, reuse_v.len, stamp_now);
     }
@@ -706,7 +766,7 @@ static idx_outcome_t index_volume_backfill(cdc_fileindex_t *idx, const char *dri
     double elapsed = now_mono() - started;
     char line[1024];
     snprintf(line, sizeof(line),
-             "index: %s 文件 %llu 个（跳过无 FRN %llu 个），复用缓存 %llu 个，"
+             "index: %s 文件 %llu 个（跳过无 FRN %llu 个），复用摘要 %llu 个，"
              "新算 %llu 个，用时 %.1fs",
              drive, (unsigned long long)n_res, (unsigned long long)skipped,
              (unsigned long long)reused_full, (unsigned long long)newly, elapsed);
@@ -772,6 +832,81 @@ static idx_outcome_t index_volume(cdc_fileindex_t *idx, const char *drive, int q
     return index_volume_backfill(idx, drive, serial, journal_id, next_usn, quiet);
 }
 
+/* 只做增量追赶，不回填（页面查询用：查询前确保新鲜，绝不触发全量回填）。
+ * 返回 1=追赶成功，0=增量不可用。 */
+static int index_volume_incremental_only(cdc_fileindex_t *idx, const char *drive,
+                                         int quiet, int do_hash) {
+    uint64_t serial = 0, journal_id = 0;
+    int64_t first_usn = 0, next_usn = 0;
+    if (cdc_volume_usn_state(drive, &serial, &journal_id, &first_usn,
+                             &next_usn) != 0)
+        return 0;
+    uint64_t stored_journal = 0;
+    int64_t stored_next = 0;
+    if (cdc_fileindex_get_usn_state(idx, serial, &stored_journal,
+                                    &stored_next) != 1)
+        return 0;
+    if (!cdc_usn_state_usable(stored_journal, stored_next, journal_id,
+                              first_usn, next_usn))
+        return 0;
+    CdcUsnChangeSet changes;
+    memset(&changes, 0, sizeof(changes));
+    if (cdc_usn_changes_since(drive, stored_journal, stored_next,
+                              CDC_TOP_SKIP, CDC_TOP_SKIP_N, &changes) != 0)
+        return 0;
+    idx_outcome_t o = index_volume_incremental(idx, drive, serial, &changes,
+                                               quiet, do_hash, now_mono());
+    cdc_usn_change_set_free(&changes);
+    return o.status == IDX_INCREMENTED ? 1 : 0;
+}
+
+/* 只读新鲜度（Rust freshness_from_state；index_status 用，不触发同步）。
+ * state_out 填 fresh | behind | stale | missing | unavailable 之一；
+ * serial_out 填卷序列号（卷打不开时填 0）。返回 0。 */
+int cdc_index_freshness(cdc_fileindex_t *idx, const char *drive,
+                        uint64_t *serial_out, char *state_out, size_t cap) {
+    uint64_t serial = 0, journal_id = 0;
+    int64_t first_usn = 0, next_usn = 0;
+    const char *state = "unavailable";
+    if (serial_out) *serial_out = 0;
+    if (cdc_volume_usn_state(drive, &serial, &journal_id, &first_usn,
+                             &next_usn) == 0) {
+        if (serial_out) *serial_out = serial;
+        uint64_t stored_journal = 0;
+        int64_t stored_next = 0;
+        if (cdc_fileindex_get_usn_state(idx, serial, &stored_journal,
+                                        &stored_next) != 1) {
+            state = "missing";
+        } else if (!cdc_usn_state_usable(stored_journal, stored_next,
+                                         journal_id, first_usn, next_usn)) {
+            state = "stale";
+        } else {
+            state = stored_next == next_usn ? "fresh" : "behind";
+        }
+    }
+    if (state_out && cap) snprintf(state_out, cap, "%s", state);
+    return 0;
+}
+
+/* 查询前确保一卷新鲜（Rust ensure_index_scope_fresh）：Fresh 直接用；
+ * Behind 跑一次增量（仅增量，不回填；do_hash=1 时补算摘要）。
+ * 返回 1=新鲜（serial_out 已填），0=不新鲜（serial_out 填卷序列号，
+ * 卷打不开时填 0）。 */
+int cdc_index_scope_fresh(cdc_fileindex_t *idx, const char *drive, int do_hash,
+                          uint64_t *serial_out) {
+    char state[16] = "";
+    uint64_t serial = 0;
+    cdc_index_freshness(idx, drive, &serial, state, sizeof(state));
+    if (strcmp(state, "behind") == 0) {
+        /* 追赶一次增量，再判一次新鲜度。 */
+        if (index_volume_incremental_only(idx, drive, 1, do_hash)) {
+            cdc_index_freshness(idx, drive, &serial, state, sizeof(state));
+        }
+    }
+    if (serial_out) *serial_out = serial;
+    return strcmp(state, "fresh") == 0 ? 1 : 0;
+}
+
 /* 逐卷索引并返回汇总行。返回 0=全部成功，1=有卷失败。 */
 static int index_all_drives(cdc_fileindex_t *idx, char **drives, size_t n_drives,
                             int quiet, int rebuild, char *summary, size_t cap) {
@@ -816,35 +951,53 @@ static int index_all_drives(cdc_fileindex_t *idx, char **drives, size_t n_drives
     return any_failed ? 1 : 0;
 }
 
-/* --index 入口：逐卷索引（增量优先，断档回填），--rebuild 强制全量重建。
+/* --index 编排（增量优先，断档回填；CLI 与 GUI 共用）：
+ * quiet=1 时不打印到 stdout；summary 总是填一条中文汇总（失败时为
+ * 失败原因）；进度同时打到 logs/index-YYYYMMDD.log。
  * 退出码：0 全部成功，1 部分卷失败，2 非管理员。 */
-static int run_index(int quiet, int rebuild) {
+int cdc_run_index_summary(int quiet, int rebuild, char *summary, size_t cap) {
     if (!is_admin()) {
-        fprintf(stderr,
-                "--index 需要管理员权限：请用管理员身份运行（计划任务请用最高权限）。\n");
+        if (summary && cap)
+            snprintf(summary, cap, "--index 需要管理员权限。");
         return 2;
     }
     size_t n_drives = 0;
     char **drives = fixed_drives(&n_drives);
     if (!drives || n_drives == 0) {
-        fprintf(stderr, "--index：没有找到固定磁盘。\n");
+        if (summary && cap)
+            snprintf(summary, cap, "--index：没有找到固定磁盘。");
         free_drives(drives, n_drives);
         return 1;
     }
     cdc_err_t err;
     cdc_fileindex_t *idx = cdc_fileindex_open_default(&err);
     if (!idx) {
-        fprintf(stderr, "--index：打不开索引库。\n");
+        if (summary && cap)
+            snprintf(summary, cap, "--index：打不开索引库。");
         free_drives(drives, n_drives);
         return 1;
     }
-    char summary[2048];
     int rc = index_all_drives(idx, drives, n_drives, quiet, rebuild, summary,
-                              sizeof(summary));
-    if (!quiet) printf("%s\n", summary);
+                              cap);
     index_log(summary);
     cdc_fileindex_close(idx);
     free_drives(drives, n_drives);
+    return rc;
+}
+
+/* --index 的 CLI 包装：退出码与原来一致（0 全部成功，1 部分卷失败，
+ * 2 非管理员），失败原因打 stderr，成功汇总在非 quiet 时打 stdout。 */
+static int run_index(int quiet, int rebuild) {
+    char summary[2048] = "";
+    int rc = cdc_run_index_summary(quiet, rebuild, summary, sizeof(summary));
+    if (rc == 2) {
+        fprintf(stderr,
+                "--index 需要管理员权限：请用管理员身份运行（计划任务请用最高权限）。\n");
+    } else if (rc != 0) {
+        fprintf(stderr, "%s\n", summary);
+    } else if (!quiet) {
+        printf("%s\n", summary);
+    }
     return rc;
 }
 
@@ -881,8 +1034,25 @@ int main(int argc, char **argv) {
         return cdc_mft_probe_volume(drive);
     }
 #endif
+    if (argc == 1) {
+        /* 默认分支：GUI（无 CLI 参数时）。
+         * 预热先行：浏览器进程拉起与后端初始化重叠；失败不致命，
+         * cdc_host_run() 里还会再试一次。 */
+#ifdef _WIN32
+        (void)cdc_host_prewarm();
+        if (cdc_gui_register_commands() != 0) {
+            fprintf(stderr, "注册后端命令失败。\n");
+            return 1;
+        }
+        return cdc_host_run(GetModuleHandleW(NULL), SW_SHOWDEFAULT);
+#else
+        fprintf(stderr, "GUI 仅支持 Windows（本机为 Linux 构建）。\n");
+        return 2;
+#endif
+    }
     fprintf(stderr,
             "usage:\n"
+            "  %s                         启动图形界面（仅 Windows）\n"
             "  %s selftest | --selftest   移植单元测试\n"
             "  %s --index [--quiet] [--rebuild]  常驻索引（需管理员；exit 2=未提权）\n"
             "  %s big <dir>               大文件扫描（分档阈值过滤，按大小降序）\n"
@@ -890,7 +1060,7 @@ int main(int argc, char **argv) {
             "  %s probe <C>               打开卷并读 NTFS 卷信息\n"
 #endif
             ,
-            argv[0], argv[0], argv[0]
+            argv[0], argv[0], argv[0], argv[0]
 #ifdef _WIN32
             ,
             argv[0]

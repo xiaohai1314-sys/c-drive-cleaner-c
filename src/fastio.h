@@ -56,7 +56,7 @@ typedef struct {
 
 typedef struct {
     size_t idx;
-    uint8_t digest[32];
+    uint8_t digest[32]; /* XXH3-64 载体编码（见 sampling.h），不是 BLAKE3 */
 } CdcHeadResult;
 
 /* 卷句柄 LCN 合并直读。返回成功算出摘要的条数（写入 out，容量 n）。
@@ -75,7 +75,7 @@ typedef struct {
 
 typedef struct {
     size_t idx;
-    uint8_t digest[32];
+    uint8_t digest[32]; /* XXH3-64 载体编码（见 sampling.h），不是 BLAKE3 */
     int has_file_id;
     CdcFileId file_id;
 } CdcIocpResult;
@@ -91,5 +91,27 @@ size_t cdc_iocp_read_heads(const CdcIocpRequest *reqs, size_t n, size_t concurre
  * cdc_physical_disk_id：0=成功并填 out。 */
 int cdc_is_ssd(const char *drive);
 int cdc_physical_disk_id(const char *drive, uint32_t *dev_type, uint32_t *dev_num);
+
+/* ---------------- 并行（线程池式 parallel-for） ---------------- */
+/* 跨平台线程池：POSIX pthread / Windows CreateThread（复用 mft.c 的
+ * 跨平台线程模式：调用线程也参与干活）。
+ * cdc_par_for(n, nthreads, fn, ctx)：把下标 [0,n) 分给 worker，
+ * 每个下标恰好被一个 worker 处理一次；nthreads<=1 或 n<=1 时顺序执行；
+ * 建线程失败时退化为更少线程（剩余工作由已建线程 + 调用线程跑完，
+ * 不报错、不丢下标）。fn 不得假设调用顺序。
+ * fn 内共享的回调（如 on_tick）与共享小状态（如 drive hint 缓存）
+ * 必须用 cdc_shared_lock() 串行化。
+ * 返回 0 成功；-1 仅表示 fn 为 NULL。 */
+typedef void (*cdc_par_work_fn)(void *ctx, size_t idx);
+int cdc_par_for(size_t n, size_t nthreads, cdc_par_work_fn fn, void *ctx);
+/* 在线逻辑 CPU 数（>=1）。 */
+size_t cdc_par_cpu_count(void);
+/* 哈希阶段的 worker 数策略：SSD 激进（min(ncpu, 32)）、HDD 保守
+ *（min(ncpu, 4)）；至少 1。NVMe 上放宽并发上限即指 SSD 这档。 */
+size_t cdc_par_hash_workers(int is_ssd);
+/* 共享小状态锁：并行 worker 回调 on_tick、读写 drive hint 缓存等
+ * 共享小状态时持有。只包极短临界区，不跨越 I/O。 */
+void cdc_shared_lock(void);
+void cdc_shared_unlock(void);
 
 #endif

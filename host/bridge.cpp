@@ -9,8 +9,16 @@
 
 #include <WebView2.h>
 
+#ifdef __MINGW32__
+#include "mingw_uuids.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
+
+// mimalloc（性能优化项 6）：桥只显式调 mi_*，不用 -include
+// mimalloc-override.h 的宏覆盖（C++ 翻译单元里宏覆盖会干扰标准库头文件）。
+#include "mimalloc.h"
 
 #include <mutex>
 #include <new>
@@ -358,8 +366,9 @@ void dispatch_and_reply(HWND hwnd, long id, const std::string &cmd,
     enqueue_reply(hwnd, build_reply(id, false, nullptr,
                                     out_error ? out_error : "command failed"));
   }
-  free(out_json);
-  free(out_error);
+  // 后端返回的串由 malloc（全局替换为 mimalloc）分配，这里必须用 mi_free。
+  mi_free(out_json);
+  mi_free(out_error);
 }
 
 }  // namespace

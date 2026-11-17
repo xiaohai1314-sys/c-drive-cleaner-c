@@ -106,6 +106,35 @@ wchar_t *cdc_utf8_to_wide(const char *utf8);
  * 同策略）。NULL 输入返回 NULL。 */
 char *cdc_wide_to_utf8(const wchar_t *wide);
 
+/* ---------------- 目录枚举 ---------------- */
+
+/* 单目录枚举回调：name 为 UTF-8 文件名（不含路径，仅在回调期间有效，
+ * 要保留请自行拷贝）；is_dir；is_symlink（Windows 上指重解析点，
+ * POSIX 上指符号链接）；size（目录/链接为 0）；mtime 为 Unix 秒
+ * （取不到为 0）；attrs 在 Windows 上是 dwFileAttributes，POSIX 上
+ * 是 st_mode。返回 0 继续，非 0 立即停止（该值原样返回给调用方）。 */
+typedef int (*cdc_dir_entry_fn)(const char *name, int is_dir, int is_symlink,
+                                uint64_t size, uint64_t mtime, uint32_t attrs,
+                                void *ctx);
+
+/* 枚举 dir 的直接子项（不含 "." ".."，不递归）。Windows 用
+ * NtQueryDirectoryFile + 64KB 缓冲批量取（一次系统调用取多项，
+ * 替代 FindFirstFileW/FindNextFileW 的逐项调用）；POSIX 用
+ * opendir/readdir + lstat（与旧代码同语义）。
+ * 返回 CDC_OK（零项也是 OK）；目录不存在返回 CDC_ERR_NOT_FOUND；
+ * 其它打不开的情况返回 CDC_ERR_IO；回调返回的非 0 值原样返回。 */
+int cdc_enum_dir(const char *dir, cdc_dir_entry_fn cb, void *ctx);
+
+/* ---- 内部测试钩子 ---- */
+
+/* 解析一包 FILE_DIRECTORY_INFORMATION（buf 长 n 字节），对每个非
+ * "." ".." 的项调 cb。name 在一次调用内有效（复用的划痕缓冲 scratch）。
+ * 供测试直接调用（覆盖 Windows 枚举最容易出错的链式遍历与 UTF-16LE
+ * 解码）；生产代码只经 cdc_enum_dir 走它。buf 损坏（越界/截断）
+ * 返回 CDC_ERR_IO；回调的非 0 返回值原样返回。 */
+int cdc_direnum_parse_batch(const uint8_t *buf, size_t n, cdc_dir_entry_fn cb,
+                            void *ctx, cdc_buf_t *scratch);
+
 /* ---------------- 日志 ---------------- */
 
 typedef enum {

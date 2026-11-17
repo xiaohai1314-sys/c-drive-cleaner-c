@@ -29,6 +29,14 @@ endif()
 
 target_compile_features(cdc_host PUBLIC cxx_std_17)
 
+# mimalloc（性能优化项 6）：桥接层释放后端命令返回的 JSON 字符串
+#（*out_json / *out_error 由后端 malloc 分配——全局替换后即 mi_malloc），
+# 所以 bridge.cpp 用 mi_free、host.cpp 用 mi_strdup；与 C 后端同一分配器。
+# 注意：这里只显式调 mi_*，不用 -include mimalloc-override.h 的宏覆盖
+#（C++ 翻译单元里宏覆盖会干扰标准库头文件）；new/delete 仍走 C++ 运行时。
+target_include_directories(cdc_host SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party/mimalloc/include)
+target_link_libraries(cdc_host PRIVATE mimalloc)
+
 if(MSVC)
   target_compile_options(cdc_host PRIVATE /utf-8 /W4)
 else()
@@ -36,8 +44,9 @@ else()
 endif()
 
 # WebView2 运行时（WebView2Loader.dll）由用户机器的 Edge WebView2
-# Runtime 提供，不随程序分发；链接期只需要 ole32 / user32 / shlwapi。
-target_link_libraries(cdc_host PUBLIC ole32 user32 shlwapi)
+# Runtime 提供，不随程序分发；链接期只需要 ole32 / user32 / shlwapi /
+# uuid（QueryInterface 里比较 IID_IUnknown 用）。
+target_link_libraries(cdc_host PUBLIC ole32 user32 shlwapi uuid)
 
 if(DEFINED CDC_WEBVIEW2_LOADER_LIB)
   target_link_libraries(cdc_host PRIVATE ${CDC_WEBVIEW2_LOADER_LIB})

@@ -115,8 +115,10 @@ int cdc_send_to_recycle(const char **paths, size_t npaths, char ***out_failed,
         char *dup = ((char **)eligible.data)[i];
         if (cdc_vec_push(&failed, &dup) != CDC_OK) free(dup);
     }
-    eligible.data = NULL;
-    eligible.len = eligible.cap = 0;
+    /* 字符串指针已移交 failed；cdc_vec_free 只释放指针数组本身，不碰
+     * 元素（字符串现归 failed 所有）。注意：不能只写
+     * eligible.data = NULL（会丢掉指针数组的堆分配，ASan 报 128 字节泄漏）。 */
+    cdc_vec_free(&eligible);
 #endif
     for (size_t i = 0; i < eligible.len; i++) free(((char **)eligible.data)[i]);
     cdc_vec_free(&eligible);

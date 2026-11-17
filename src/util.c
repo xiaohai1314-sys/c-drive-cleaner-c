@@ -27,6 +27,7 @@
 #define CDC_STRCPY(dst, dstsz, src) strcpy_s((dst), (dstsz), (src))
 #define CDC_WCSCAT(dst, dstsz, src) wcscat_s((dst), (dstsz), (src))
 #else
+#include <dirent.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -237,7 +238,30 @@ void *cdc_vec_get(cdc_vec_t *v, size_t i) {
     return (uint8_t *)v->data + i * v->elem_size;
 }
 
-/* ---------------- UTF-8 编解码（POSIX 手写版；Windows 用 Win32 API） ---------------- */
+/* 码点 -> UTF-8（调用方保证 cp 合法：<0x80 或 0x800..0x10FFFF 且非代理区）。
+ * 两平台共用：POSIX 的 cdc_wide_to_utf8 与目录枚举的 UTF-16LE 解析都用它。 */
+static size_t utf8_encode(uint32_t cp, char out[4]) {
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
 
 #ifndef _WIN32
 
@@ -282,29 +306,6 @@ static int utf8_decode(const unsigned char *s, size_t len,
     return CDC_OK;
 }
 
-/* 码点 -> UTF-8（调用方保证 cp 合法：<0x80 或 0x800..0x10FFFF 且非代理区）。 */
-static size_t utf8_encode(uint32_t cp, char out[4]) {
-    if (cp < 0x80) {
-        out[0] = (char)cp;
-        return 1;
-    }
-    if (cp < 0x800) {
-        out[0] = (char)(0xC0 | (cp >> 6));
-        out[1] = (char)(0x80 | (cp & 0x3F));
-        return 2;
-    }
-    if (cp < 0x10000) {
-        out[0] = (char)(0xE0 | (cp >> 12));
-        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        out[2] = (char)(0x80 | (cp & 0x3F));
-        return 3;
-    }
-    out[0] = (char)(0xF0 | (cp >> 18));
-    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-    out[3] = (char)(0x80 | (cp & 0x3F));
-    return 4;
-}
 
 #endif /* _WIN32 */
 
@@ -720,4 +721,221 @@ void cdc_log(cdc_log_level_t level, const char *fmt, ...) {
         CDC_LOG_LOCK();
     }
     CDC_LOG_UNLOCK();
+}
+
+/* ---------------- 目录枚举 ---------------- */
+
+/* FILETIME（100ns，1601 起）-> Unix 秒；与 mft_filetime_to_unix 同式，
+ * 这里不 include mft_util.h（基础层不依赖上层模块）。 */
+static uint64_t direnum_filetime_to_unix(uint64_t ft) {
+    uint64_t secs = ft / 10000000ULL;
+    return secs >= 11644473600ULL ? secs - 11644473600ULL : 0;
+}
+
+/* UTF-16LE 码元串（nbytes 字节，不要求 NUL 结尾）-> UTF-8，追加进 out。
+ * 代理对正确组合；孤立代理对按 U+FFFD（与 cdc_wide_to_utf8 同策略）。 */
+static int utf16le_append_utf8(const uint8_t *bytes, size_t nbytes,
+                               cdc_buf_t *out) {
+    size_t i = 0;
+    while (i + 2 <= nbytes) {
+        uint32_t cp = (uint32_t)bytes[i] | ((uint32_t)bytes[i + 1] << 8);
+        char tmp[4];
+        size_t n;
+        i += 2;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            /* 高代理：后跟低代理则组合，否则 U+FFFD。 */
+            if (i + 2 <= nbytes) {
+                uint32_t lo = (uint32_t)bytes[i] | ((uint32_t)bytes[i + 1] << 8);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000u + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i += 2;
+                } else {
+                    cp = 0xFFFD;
+                }
+            } else {
+                cp = 0xFFFD;
+            }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+            cp = 0xFFFD; /* 孤立低代理 */
+        }
+        n = utf8_encode(cp, tmp);
+        if (cdc_buf_append(out, tmp, n) != CDC_OK) return CDC_ERR_NOMEM;
+    }
+    return CDC_OK;
+}
+
+/* FILE_DIRECTORY_INFORMATION 的定长头（64 字节）+ 变长 UTF-16LE 名。
+ * 字段偏移与 Windows 头文件一致；内核写出小端序，Windows 各架构
+ * 全是小端，直接按本机序读。 */
+#define CDC_DIRENUM_HDR_SIZE 64
+
+static uint32_t direnum_u32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t direnum_u64le(const uint8_t *p) {
+    uint64_t v = 0;
+    int i;
+    for (i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
+    return v;
+}
+
+int cdc_direnum_parse_batch(const uint8_t *buf, size_t n, cdc_dir_entry_fn cb,
+                            void *ctx, cdc_buf_t *scratch) {
+    size_t off = 0;
+    if (!cb || !scratch) return CDC_ERR_INVALID_ARG;
+    if (!buf && n != 0) return CDC_ERR_INVALID_ARG;
+    while (off < n) {
+        uint32_t next, attrs, name_len;
+        uint64_t size, mtime;
+        int is_dir, is_symlink, rc;
+        const char *name;
+        if (n - off < CDC_DIRENUM_HDR_SIZE) return CDC_ERR_IO; /* 截断的头 */
+        next = direnum_u32le(buf + off + 0);
+        attrs = direnum_u32le(buf + off + 56);
+        name_len = direnum_u32le(buf + off + 60);
+        if (name_len > n - off - CDC_DIRENUM_HDR_SIZE) return CDC_ERR_IO;
+        cdc_buf_clear(scratch);
+        if (utf16le_append_utf8(buf + off + 64, name_len, scratch) != CDC_OK)
+            return CDC_ERR_NOMEM;
+        if (cdc_buf_reserve(scratch, 1) != CDC_OK) return CDC_ERR_NOMEM;
+        scratch->data[scratch->len] = '\0';
+        name = (const char *)scratch->data;
+        if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+            is_dir = (attrs & 0x10u) != 0; /* FILE_ATTRIBUTE_DIRECTORY */
+            is_symlink = (attrs & 0x400u) != 0; /* FILE_ATTRIBUTE_REPARSE_POINT */
+            size = is_dir ? 0 : direnum_u64le(buf + off + 40); /* EndOfFile */
+            mtime = direnum_filetime_to_unix(direnum_u64le(buf + off + 24));
+            rc = cb(name, is_dir, is_symlink, size, mtime, attrs, ctx);
+            if (rc != 0) return rc;
+        }
+        if (next == 0) break;
+        /* 链偏移在交付本项后才校验：坏链不吞掉前面已交付的有效项。 */
+        if (next < CDC_DIRENUM_HDR_SIZE || next > n - off) return CDC_ERR_IO;
+        off += next;
+    }
+    return CDC_OK;
+}
+
+int cdc_enum_dir(const char *dir, cdc_dir_entry_fn cb, void *ctx) {
+    if (!dir || !cb) return CDC_ERR_INVALID_ARG;
+#ifdef _WIN32
+    {
+        /* NtQueryDirectoryFile 用 GetProcAddress 动态取：不改链接
+         * （不用加 -lntdll），每次枚举取一次（一次枚举一次系统调用
+         * 级别的开销，与随后成批的目录读取相比可忽略）。 */
+        typedef LONG(NTAPI *direnum_nt_query_fn)(
+            HANDLE FileHandle, HANDLE Event, void *ApcRoutine,
+            void *ApcContext, void *IoStatusBlock, void *FileInformation,
+            ULONG Length, ULONG FileInformationClass, BOOLEAN ReturnSingleEntry,
+            void *FileName, BOOLEAN RestartScan);
+        typedef struct {
+            union {
+                LONG Status;
+                void *Pointer;
+            } u;
+            ULONG_PTR Information;
+        } direnum_io_status_t;
+        wchar_t *wdir;
+        HANDLE h;
+        direnum_nt_query_fn pfn;
+        HMODULE ntdll;
+        uint8_t *buf;
+        cdc_buf_t scratch;
+        int rc = CDC_OK;
+        BOOLEAN restart = TRUE;
+
+        wdir = cdc_utf8_to_wide(dir);
+        if (!wdir) return CDC_ERR_UTF8;
+        h = CreateFileW(wdir, FILE_LIST_DIRECTORY,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        free(wdir);
+        if (h == INVALID_HANDLE_VALUE) {
+            DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+                return CDC_ERR_NOT_FOUND;
+            return CDC_ERR_IO;
+        }
+        ntdll = GetModuleHandleW(L"ntdll.dll");
+        pfn = ntdll ? (direnum_nt_query_fn)(void *)GetProcAddress(
+                          ntdll, "NtQueryDirectoryFile")
+                    : NULL;
+        if (!pfn) {
+            CloseHandle(h);
+            return CDC_ERR_IO;
+        }
+        buf = (uint8_t *)malloc(65536);
+        if (!buf) {
+            CloseHandle(h);
+            return CDC_ERR_NOMEM;
+        }
+        cdc_buf_init(&scratch);
+        for (;;) {
+            direnum_io_status_t iosb;
+            LONG st;
+            memset(&iosb, 0, sizeof iosb);
+            st = pfn(h, NULL, NULL, NULL, &iosb, buf, 65536,
+                     1 /* FileDirectoryInformation */, FALSE, NULL, restart);
+            restart = FALSE;
+            if ((uint32_t)st == 0xC0000018u) break; /* STATUS_NO_MORE_FILES */
+            if (st != 0) {
+                rc = CDC_ERR_IO;
+                break;
+            }
+            if (iosb.Information == 0) break; /* 防御：成功但零字节 */
+            rc = cdc_direnum_parse_batch(buf, (size_t)iosb.Information, cb,
+                                         ctx, &scratch);
+            if (rc != CDC_OK) break;
+        }
+        free(buf);
+        cdc_buf_free(&scratch);
+        CloseHandle(h);
+        return rc;
+    }
+#else
+    {
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        cdc_buf_t path;
+        int rc = CDC_OK;
+        if (!d) {
+            if (errno == ENOENT) return CDC_ERR_NOT_FOUND;
+            return CDC_ERR_IO;
+        }
+        cdc_buf_init(&path);
+        while ((e = readdir(d)) != NULL) {
+            struct stat st;
+            size_t dl;
+            int is_dir, is_symlink;
+            uint64_t size, mtime;
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            /* lstat 取 size/mtime/is_dir/is_symlink（与旧代码同语义）；
+             * 路径拼进复用的划痕缓冲，不逐项 malloc。 */
+            cdc_buf_clear(&path);
+            if (cdc_buf_append_str(&path, dir) != CDC_OK ||
+                ((dl = strlen(dir)) > 0 && dir[dl - 1] != '/' &&
+                 cdc_buf_push(&path, (uint8_t)'/') != CDC_OK) ||
+                cdc_buf_append_str(&path, e->d_name) != CDC_OK ||
+                cdc_buf_reserve(&path, 1) != CDC_OK) {
+                rc = CDC_ERR_NOMEM;
+                break;
+            }
+            path.data[path.len] = '\0';
+            if (lstat((const char *)path.data, &st) != 0) continue;
+            is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+            is_symlink = S_ISLNK(st.st_mode) ? 1 : 0;
+            size = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
+            mtime = (uint64_t)st.st_mtime;
+            rc = cb(e->d_name, is_dir, is_symlink, size, mtime,
+                    (uint32_t)st.st_mode, ctx);
+            if (rc != 0) break;
+        }
+        closedir(d);
+        cdc_buf_free(&path);
+        return rc;
+    }
+#endif
 }

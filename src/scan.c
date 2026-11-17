@@ -2,12 +2,19 @@
  * scan_big / scan_dups / run_dup_pipeline / run_dup_pipelines / hash_index_groups。
  *
  * 并行性说明（与 Rust 版的行为差异，仅影响速度不影响结果）：
- *   - 枚举、管线各阶段、双缓冲全哈希在 C 版是顺序执行（无 Rayon/线程池）；
- *     机械盘的 NCQ 排序保留（同盘按 sort_key 排，SSD 在前），但不并发。
+ *   - 各哈希阶段（sample/strong/probe/full）与 Linux 的 IOCP 等价路径
+ *     用 fastio.c 的 cdc_par_for 按文件并行（生产者/消费者队列）；
+ *     每个候选只被一个 worker 处理，候选内部字段无需额外锁；
+ *     on_tick 回调与 drive hint 缓存由 cdc_shared_lock() 串行化。
+ *     阶段结束后分组前都按 (size, 摘要) 排序，所以最终分组与
+ *     顺序版一致；取消语义也一致（worker 入口先查 cancel）。
+ *   - 机械盘的 NCQ 排序保留（同盘按 sort_key 排，SSD 在前）；
+ *     worker 数按 SSD/HDD 分档（SSD 激进、HDD 保守）。
+ *   - 全哈希 ≥16MB 用 2MB 缓冲（与 Rust 的双缓冲分支同一档位），
+ *     仍是单缓冲循环；读与哈希的重叠主要靠跨文件并行 +
+ *     内核 readahead，单文件内再开读线程的收益很小，暂不做。
  *   - 阶段内顺序与 Rust 的 HashMap 迭代顺序不同，但所有分组最后都按
  *     (size, 摘要) 排序、组内按 path 排序，所以最终分组结果一致。
- *   - 全哈希 ≥16MB 的 Rust 双缓冲（读盘与计算流水线）在 C 版是 1MB 单缓冲
- *     循环，结果一致。
  *
  * 所有权约定：DupCandidate 的 path 是 owned；各阶段 vec 之间用"移动"
  * （push 后把源 path 置 NULL）传递，丢弃的项当场 cand_free。
@@ -26,9 +33,10 @@
 #include <time.h>
 
 #include "bigfile.h"
-#include "blake3.h"
+#include "blake3.h" /* 只剩 full 确认用 BLAKE3；采样层见 sampling.h */
 #include "fastio.h"
 #include "mft.h"
+#include "sampling.h"
 #include "util.h"
 
 #ifdef _WIN32
@@ -51,8 +59,14 @@ static int is_cancelled(const CdcScanOpts *opts) {
     return opts && opts->cancel && *opts->cancel;
 }
 
+/* on_tick 串行化：回调可能非线程安全（如测试的计数器），并行路径下
+ * 多个 worker 会同时调它；用 fastio.c 的 cdc_shared_lock() 包住这次调用。 */
 static void call_tick(const CdcScanOpts *opts) {
-    if (opts && opts->on_tick) opts->on_tick(opts->tick_ctx);
+    if (opts && opts->on_tick) {
+        cdc_shared_lock();
+        opts->on_tick(opts->tick_ctx);
+        cdc_shared_unlock();
+    }
 }
 
 static double now_mono(void) {
@@ -78,6 +92,9 @@ static int digest_eq(const uint8_t a[32], const uint8_t b[32]) {
 
 /* ---------------- 盘符 hint（OpenFileById 用；Rust 的 thread_local DRIVE_HINTS） ---------------- */
 
+/* drive hint 缓存：并行阶段多 worker 会同时调这里；g_hints 的读写
+ * 用 cdc_shared_lock() 串行化。打开句柄本身在锁外做，拿到后再在
+ * 锁内认领（已有缓存时关闭自己新开的，避免句柄泄漏）。 */
 static void *drive_hint_for_path(const char *path) {
 #ifdef _WIN32
     static void *g_hints[26];
@@ -85,8 +102,21 @@ static void *drive_hint_for_path(const char *path) {
     if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
     if (ch < 'A' || ch > 'Z') ch = 'C';
     int i = ch - 'A';
-    if (!g_hints[i]) g_hints[i] = cdc_open_drive_hint(ch);
-    return g_hints[i];
+    cdc_shared_lock();
+    void *h = g_hints[i];
+    cdc_shared_unlock();
+    if (h) return h;
+    void *nh = cdc_open_drive_hint(ch);
+    if (!nh) return NULL;
+    cdc_shared_lock();
+    if (!g_hints[i]) {
+        g_hints[i] = nh;
+        nh = NULL;
+    }
+    h = g_hints[i];
+    cdc_shared_unlock();
+    if (nh) CloseHandle((HANDLE)nh);
+    return h;
 #else
     (void)path;
     return NULL;
@@ -105,10 +135,11 @@ static CdcFile *open_checked_with_size(const char *path, uint64_t frn, uint32_t 
 
 /* ---------------- 摘要原语（对照 main.rs 的 hash_chunk / sample / strong / probe / full） ---------------- */
 
-/* 读 offset 起 length 字节进 hasher（buf 分片）。寻道/读取出错返回 -1；
- * 文件尾短读只摘要读到的部分（与 Rust 的 hash_chunk 一致）。 */
-static int hash_chunk(CdcFile *f, uint8_t *buf, size_t buflen, uint64_t offset,
-                      uint64_t length, blake3_hasher *h) {
+/* 读 offset 起 length 字节进 XXH3 流式状态（buf 分片）。寻道/读取出错
+ * 返回 -1；文件尾短读只摘要读到的部分（与 Rust 的 hash_chunk 一致，
+ * 算法换成 XXH3）。 */
+static int hash_chunk_xxh(CdcFile *f, uint8_t *buf, size_t buflen, uint64_t offset,
+                          uint64_t length, cdc_xxh3_state_t *st) {
     uint64_t remaining = length;
     uint64_t pos = offset;
     while (remaining > 0) {
@@ -116,15 +147,65 @@ static int hash_chunk(CdcFile *f, uint8_t *buf, size_t buflen, uint64_t offset,
         size_t got = 0;
         if (cdc_file_read_at(f, pos, buf, want, &got) != 0) return -1;
         if (got == 0) break;
-        blake3_hasher_update(h, buf, got);
+        if (cdc_xxh3_state_update(st, buf, got) != 0) return -1;
         pos += got;
         remaining -= got;
     }
     return 0;
 }
 
-/* 整文件顺序哈希（1MB 缓冲；每 16 块检查一次取消，与 Rust 的 full_hash_by_frn
- * 单缓冲分支一致；≥16MB 的双缓冲分支在 C 版也是这个循环）。 */
+/* 小文件全文采样：整文件顺序读一遍算 XXH3（1MB 缓冲）。
+ * sample / strong 的 size <= chunk*3 分支用它，不再走 BLAKE3 全文哈希；
+ * 旧版这里返回的是 BLAKE3 全文摘要并被抄给 full，新版 sample 与 full
+ * 算法不同，full 留给阶段 3。 */
+static int whole_file_xxh_by_frn(const char *path, uint64_t frn, uint64_t size,
+                                 uint8_t digest[32], CdcFileId *fid_out,
+                                 int *has_fid_out) {
+    (void)size;
+    int hid = 0;
+    CdcFileId id = {0, 0};
+    uint64_t actual = 0;
+    CdcFile *f = open_checked_with_size(path, frn, CDC_FILE_FLAG_SEQUENTIAL_SCAN,
+                                        &hid, &id, &actual);
+    if (!f) return -1;
+    uint8_t *buf = malloc(CDC_SCAN_FULL_BUF_SIZE);
+    if (!buf) {
+        cdc_file_close(f);
+        return -1;
+    }
+    cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+    if (!st) {
+        free(buf);
+        cdc_file_close(f);
+        return -1;
+    }
+    int rc = 0;
+    for (;;) {
+        size_t got = 0;
+        if (cdc_file_read_seq(f, buf, CDC_SCAN_FULL_BUF_SIZE, &got) != 0) {
+            rc = -1;
+            break;
+        }
+        if (got == 0) break;
+        if (cdc_xxh3_state_update(st, buf, got) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+    uint64_t xxh = cdc_xxh3_state_finalize(st);
+    cdc_xxh3_state_free(st);
+    free(buf);
+    cdc_file_close(f);
+    if (rc != 0) return -1;
+    cdc_xxh_to_digest32(xxh, digest);
+    if (fid_out) *fid_out = id;
+    if (has_fid_out) *has_fid_out = hid;
+    return 0;
+}
+
+/* 整文件顺序哈希（每 16 块检查一次取消，与 Rust 的 full_hash_by_frn
+ * 单缓冲分支一致；≥16MB 用 2MB 缓冲，与 Rust 的双缓冲分支同一档位，
+ * C 版仍是单缓冲循环，大缓冲减少 read 调用次数）。 */
 static int full_hash_by_frn(const char *path, uint64_t frn, uint8_t digest[32],
                             CdcFileId *fid_out, int *has_fid_out,
                             const CdcScanOpts *opts) {
@@ -134,7 +215,9 @@ static int full_hash_by_frn(const char *path, uint64_t frn, uint8_t digest[32],
     CdcFile *f = open_checked_with_size(path, frn, CDC_FILE_FLAG_SEQUENTIAL_SCAN,
                                         &hid, &id, &actual);
     if (!f) return -1;
-    uint8_t *buf = malloc(CDC_SCAN_FULL_BUF_SIZE);
+    size_t buflen = actual >= CDC_SCAN_FULL_LARGE_THRESHOLD ? CDC_SCAN_FULL_BUF_LARGE
+                                                            : CDC_SCAN_FULL_BUF_SIZE;
+    uint8_t *buf = malloc(buflen);
     if (!buf) {
         cdc_file_close(f);
         return -1;
@@ -149,7 +232,7 @@ static int full_hash_by_frn(const char *path, uint64_t frn, uint8_t digest[32],
             break;
         }
         size_t got = 0;
-        if (cdc_file_read_seq(f, buf, CDC_SCAN_FULL_BUF_SIZE, &got) != 0) {
+        if (cdc_file_read_seq(f, buf, buflen, &got) != 0) {
             rc = -1;
             break;
         }
@@ -170,11 +253,12 @@ int cdc_full_hash_file(const char *path, uint64_t frn, uint8_t digest[32]) {
     return full_hash_by_frn(path, frn, digest, NULL, NULL, NULL);
 }
 
-/* 采样：头、中、尾各取 chunk_len；size <= chunk_len*3 时直接全文哈希。 */
+/* 采样：头、中、尾各取 chunk_len；size <= chunk_len*3 时直接全文 XXH3。
+ * digest[32] 是 XXH3-64 载体编码（见 sampling.h），不是 BLAKE3。 */
 static int sample_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
                               uint8_t digest[32], CdcFileId *fid_out, int *has_fid_out) {
     if (size <= CDC_SCAN_SAMPLE_CHUNK * 3)
-        return full_hash_by_frn(path, frn, digest, fid_out, has_fid_out, NULL);
+        return whole_file_xxh_by_frn(path, frn, size, digest, fid_out, has_fid_out);
     int hid = 0;
     CdcFileId id = {0, 0};
     uint64_t actual = 0;
@@ -186,31 +270,40 @@ static int sample_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
         cdc_file_close(f);
         return -1;
     }
-    blake3_hasher h;
-    blake3_hasher_init(&h);
+    cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+    if (!st) {
+        free(buf);
+        cdc_file_close(f);
+        return -1;
+    }
     int rc = 0;
-    if (hash_chunk(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK, 0, CDC_SCAN_SAMPLE_CHUNK, &h) != 0)
+    if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK, 0, CDC_SCAN_SAMPLE_CHUNK,
+                      st) != 0)
         rc = -1;
-    else if (hash_chunk(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK, size / 2,
-                        CDC_SCAN_SAMPLE_CHUNK, &h) != 0)
+    else if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK, size / 2,
+                            CDC_SCAN_SAMPLE_CHUNK, st) != 0)
         rc = -1;
-    else if (hash_chunk(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK, size - CDC_SCAN_SAMPLE_CHUNK,
-                        CDC_SCAN_SAMPLE_CHUNK, &h) != 0)
+    else if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_SAMPLE_CHUNK,
+                            size - CDC_SCAN_SAMPLE_CHUNK, CDC_SCAN_SAMPLE_CHUNK,
+                            st) != 0)
         rc = -1;
+    uint64_t xxh = cdc_xxh3_state_finalize(st);
+    cdc_xxh3_state_free(st);
     free(buf);
     cdc_file_close(f);
     if (rc != 0) return -1;
-    blake3_hasher_finalize(&h, digest, 32);
+    cdc_xxh_to_digest32(xxh, digest);
     if (fid_out) *fid_out = id;
     if (has_fid_out) *has_fid_out = hid;
     return 0;
 }
 
-/* 强采样（快速模式）：头、中、尾各取 256KB；size <= 768KB 时直接全文哈希。 */
+/* 强采样（快速模式）：头、中、尾各取 256KB；size <= 768KB 时直接全文 XXH3。
+ * digest[32] 是 XXH3-64 载体编码。 */
 static int strong_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
                               uint8_t digest[32], CdcFileId *fid_out, int *has_fid_out) {
     if (size <= CDC_SCAN_STRONG_CHUNK * 3)
-        return full_hash_by_frn(path, frn, digest, fid_out, has_fid_out, NULL);
+        return whole_file_xxh_by_frn(path, frn, size, digest, fid_out, has_fid_out);
     int hid = 0;
     CdcFileId id = {0, 0};
     uint64_t actual = 0;
@@ -222,27 +315,35 @@ static int strong_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
         cdc_file_close(f);
         return -1;
     }
-    blake3_hasher h;
-    blake3_hasher_init(&h);
+    cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+    if (!st) {
+        free(buf);
+        cdc_file_close(f);
+        return -1;
+    }
     int rc = 0;
-    if (hash_chunk(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK, 0, CDC_SCAN_STRONG_CHUNK, &h) != 0)
+    if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK, 0, CDC_SCAN_STRONG_CHUNK,
+                      st) != 0)
         rc = -1;
-    else if (hash_chunk(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK, size / 2,
-                        CDC_SCAN_STRONG_CHUNK, &h) != 0)
+    else if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK, size / 2,
+                            CDC_SCAN_STRONG_CHUNK, st) != 0)
         rc = -1;
-    else if (hash_chunk(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK, size - CDC_SCAN_STRONG_CHUNK,
-                        CDC_SCAN_STRONG_CHUNK, &h) != 0)
+    else if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_STRONG_CHUNK,
+                            size - CDC_SCAN_STRONG_CHUNK, CDC_SCAN_STRONG_CHUNK,
+                            st) != 0)
         rc = -1;
+    uint64_t xxh = cdc_xxh3_state_finalize(st);
+    cdc_xxh3_state_free(st);
     free(buf);
     cdc_file_close(f);
     if (rc != 0) return -1;
-    blake3_hasher_finalize(&h, digest, 32);
+    cdc_xxh_to_digest32(xxh, digest);
     if (fid_out) *fid_out = id;
     if (has_fid_out) *has_fid_out = hid;
     return 0;
 }
 
-/* 大文件渐进探针：25% 与 75% 处各 64KB。 */
+/* 大文件渐进探针：25% 与 75% 处各 64KB。digest[32] 是 XXH3-64 载体编码。 */
 static int probe_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
                              uint8_t digest[32], CdcFileId *fid_out, int *has_fid_out) {
     int hid = 0;
@@ -256,19 +357,26 @@ static int probe_hash_by_frn(const char *path, uint64_t frn, uint64_t size,
         cdc_file_close(f);
         return -1;
     }
-    blake3_hasher h;
-    blake3_hasher_init(&h);
+    cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+    if (!st) {
+        free(buf);
+        cdc_file_close(f);
+        return -1;
+    }
     uint64_t tail = size >= CDC_SCAN_PROBE_CHUNK ? size - CDC_SCAN_PROBE_CHUNK : 0;
     uint64_t off1 = size / 4 < tail ? size / 4 : tail;
     uint64_t off2 = size * 3 / 4 < tail ? size * 3 / 4 : tail;
     uint64_t len = CDC_SCAN_PROBE_CHUNK < size ? CDC_SCAN_PROBE_CHUNK : size;
     int rc = 0;
-    if (hash_chunk(f, buf, (size_t)CDC_SCAN_PROBE_CHUNK, off1, len, &h) != 0) rc = -1;
-    else if (hash_chunk(f, buf, (size_t)CDC_SCAN_PROBE_CHUNK, off2, len, &h) != 0) rc = -1;
+    if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_PROBE_CHUNK, off1, len, st) != 0) rc = -1;
+    else if (hash_chunk_xxh(f, buf, (size_t)CDC_SCAN_PROBE_CHUNK, off2, len, st) != 0)
+        rc = -1;
+    uint64_t xxh = cdc_xxh3_state_finalize(st);
+    cdc_xxh3_state_free(st);
     free(buf);
     cdc_file_close(f);
     if (rc != 0) return -1;
-    blake3_hasher_finalize(&h, digest, 32);
+    cdc_xxh_to_digest32(xxh, digest);
     if (fid_out) *fid_out = id;
     if (has_fid_out) *has_fid_out = hid;
     return 0;
@@ -309,14 +417,25 @@ static int read_hdd_seq_sample_and_full(const char *path, uint64_t frn, uint64_t
     blake3_hash_buf(buf, s, full);
     size_t c = (size_t)chunk_len;
     if (s <= c * 3) {
-        memcpy(sample, full, 32);
+        /* 小文件：采样即全文 XXH3（与 whole_file_xxh_by_frn 同值）。 */
+        cdc_xxh3_buf_to_digest32(buf, s, sample);
     } else {
-        blake3_hasher h;
-        blake3_hasher_init(&h);
-        blake3_hasher_update(&h, buf, c);
-        blake3_hasher_update(&h, buf + s / 2, c);
-        blake3_hasher_update(&h, buf + s - c, c);
-        blake3_hasher_finalize(&h, sample, 32);
+        cdc_xxh3_state_t *st = cdc_xxh3_state_new();
+        if (!st) {
+            free(buf);
+            return -1;
+        }
+        int xrc = 0;
+        if (cdc_xxh3_state_update(st, buf, c) != 0) xrc = -1;
+        else if (cdc_xxh3_state_update(st, buf + s / 2, c) != 0) xrc = -1;
+        else if (cdc_xxh3_state_update(st, buf + s - c, c) != 0) xrc = -1;
+        uint64_t xxh = cdc_xxh3_state_finalize(st);
+        cdc_xxh3_state_free(st);
+        if (xrc != 0) {
+            free(buf);
+            return -1;
+        }
+        cdc_xxh_to_digest32(xxh, sample);
     }
     free(buf);
     if (fid_out) *fid_out = id;
@@ -391,8 +510,8 @@ typedef struct {
     CdcFileId file_id;
     cdc_digest_set_t digests;
     int has_probe;
-    cdc_digest_t probe;
-    int dirty_head, dirty_sample, dirty_strong, dirty_full;
+    uint64_t probe_xxh; /* 探针 XXH3，只放内存，不落库（fileindex/hashcache 无此列） */
+    int dirty_head_xxh, dirty_sample_xxh, dirty_strong_xxh, dirty_full;
 } DupCandidate;
 
 static void cand_free(DupCandidate *c) {
@@ -425,8 +544,12 @@ static int cand_vec_move_all(cdc_vec_t *dst, cdc_vec_t *src) {
 }
 
 static int cand_any_digest(const DupCandidate *c) {
-    return c->digests.has_head || c->digests.has_sample || c->digests.has_strong ||
-           c->digests.has_full;
+    /* 采样层只看 xxh 字段；旧版 BLAKE3 的 has_head/has_sample/has_strong 也算：
+     * 从缓存/索引带进来的旧值要能透传进更新（写回时 COALESCE 不覆盖），
+     * 即使本轮管线不再用它们分组。 */
+    return c->digests.has_head_xxh || c->digests.has_sample_xxh ||
+           c->digests.has_strong_xxh || c->digests.has_head ||
+           c->digests.has_sample || c->digests.has_strong || c->digests.has_full;
 }
 
 /* 调度排序：SSD 在前，同盘按 sort_key，再按 path（确定性顺序）。 */
@@ -448,24 +571,23 @@ static int cmp_cand_by_size(const void *a, const void *b) {
 static int cmp_cand_by_head(const void *a, const void *b) {
     const DupCandidate *x = a, *y = b;
     if (x->size != y->size) return x->size < y->size ? -1 : 1;
-    int c = memcmp(x->digests.head.bytes, y->digests.head.bytes, 32);
-    if (c) return c;
+    if (x->digests.head_xxh != y->digests.head_xxh)
+        return x->digests.head_xxh < y->digests.head_xxh ? -1 : 1;
     return strcmp(x->path, y->path);
 }
 
 static int cmp_cand_by_sample(const void *a, const void *b) {
     const DupCandidate *x = a, *y = b;
     if (x->size != y->size) return x->size < y->size ? -1 : 1;
-    int c = memcmp(x->digests.sample.bytes, y->digests.sample.bytes, 32);
-    if (c) return c;
+    if (x->digests.sample_xxh != y->digests.sample_xxh)
+        return x->digests.sample_xxh < y->digests.sample_xxh ? -1 : 1;
     return strcmp(x->path, y->path);
 }
 
 static int cmp_cand_by_probe(const void *a, const void *b) {
     const DupCandidate *x = a, *y = b;
     if (x->size != y->size) return x->size < y->size ? -1 : 1;
-    int c = memcmp(x->probe.bytes, y->probe.bytes, 32);
-    if (c) return c;
+    if (x->probe_xxh != y->probe_xxh) return x->probe_xxh < y->probe_xxh ? -1 : 1;
     return strcmp(x->path, y->path);
 }
 
@@ -480,8 +602,8 @@ static int cmp_cand_by_full(const void *a, const void *b) {
 static int cmp_cand_by_strong(const void *a, const void *b) {
     const DupCandidate *x = a, *y = b;
     if (x->size != y->size) return x->size < y->size ? -1 : 1;
-    int c = memcmp(x->digests.strong.bytes, y->digests.strong.bytes, 32);
-    if (c) return c;
+    if (x->digests.strong_xxh != y->digests.strong_xxh)
+        return x->digests.strong_xxh < y->digests.strong_xxh ? -1 : 1;
     return strcmp(x->path, y->path);
 }
 
@@ -520,21 +642,24 @@ static void flush_candidate_hashes(cdc_hashcache_t *cache, const DupCandidate *i
     if (!cache) return;
     for (size_t i = 0; i < n; i++) {
         const DupCandidate *c = &items[i];
-        if (!(c->dirty_head || c->dirty_sample || c->dirty_strong || c->dirty_full))
+        if (!(c->dirty_head_xxh || c->dirty_sample_xxh || c->dirty_strong_xxh ||
+              c->dirty_full))
             continue;
         cdc_digest_set_t sub;
         memset(&sub, 0, sizeof sub);
-        if (c->dirty_head) {
-            sub.has_head = 1;
-            sub.head = c->digests.head;
+        /* 只写 xxh 子字段 + full：旧版 BLAKE3 的 head/sample/strong
+         * 不再由管线产生，不写（缓存里已有的旧值靠 COALESCE 保留）。 */
+        if (c->dirty_head_xxh) {
+            sub.has_head_xxh = 1;
+            sub.head_xxh = c->digests.head_xxh;
         }
-        if (c->dirty_sample) {
-            sub.has_sample = 1;
-            sub.sample = c->digests.sample;
+        if (c->dirty_sample_xxh) {
+            sub.has_sample_xxh = 1;
+            sub.sample_xxh = c->digests.sample_xxh;
         }
-        if (c->dirty_strong) {
-            sub.has_strong = 1;
-            sub.strong = c->digests.strong;
+        if (c->dirty_strong_xxh) {
+            sub.has_strong_xxh = 1;
+            sub.strong_xxh = c->digests.strong_xxh;
         }
         if (c->dirty_full) {
             sub.has_full = 1;
@@ -542,6 +667,164 @@ static void flush_candidate_hashes(cdc_hashcache_t *cache, const DupCandidate *i
         }
         cdc_hashcache_remember(cache, c->path, c->size, c->mtime, &sub, now);
     }
+}
+
+/* ---------------- 并行阶段（cdc_par_for） ---------------- */
+/* 各阶段原来是顺序循环：每项独立（打开自己的文件、算自己的摘要、
+ * 只写自己的候选字段），天然可并行。把循环体抽成 work 函数，
+ * 用 cdc_par_for 按下标分给 worker；结果与顺序版一致的原因：
+ *   - 每个候选只被一个 worker 处理，digests/dirty/file_id 无共享写；
+ *   - 阶段结束后分组前都按 (size, 摘要) 排序，与计算顺序无关；
+ *   - on_tick 由 call_tick 内部的 cdc_shared_lock() 串行化；
+ *   - 取消语义一致：worker 入口先查 cancel（不 tick），循环结束
+ *     后调用方照常按 is_cancelled(opts) 分流。
+ * worker 数按本阶段候选是否全在 SSD 上分档（cdc_par_hash_workers）。
+ * 阶段摘要函数的签名不改（xxHash 采样层在另一分支里动它们内部）。
+ */
+
+typedef struct {
+    cdc_vec_t *vec;
+    const CdcScanOpts *opts;
+} StageParCtx;
+
+static int stage_vec_all_ssd(const cdc_vec_t *v) {
+    for (size_t i = 0; i < v->len; i++) {
+        if (!CDC_VEC_AT(v, DupCandidate, i).is_ssd) return 0;
+    }
+    return 1;
+}
+
+/* 快速模式 strong：循环体与改前逐行一致（break/continue 改 return）。 */
+static void stage_strong_work(void *ctx, size_t i) {
+    StageParCtx *c = (StageParCtx *)ctx;
+    DupCandidate *cand = &CDC_VEC_AT(c->vec, DupCandidate, i);
+    const CdcScanOpts *opts = c->opts;
+    if (is_cancelled(opts)) return;
+    if (cand->digests.has_strong_xxh) return;
+    if (!cand->is_ssd && cand->size <= CDC_SCAN_HDD_SEQ_THRESHOLD) {
+        uint8_t strong[32], full[32];
+        CdcFileId fid = {0, 0};
+        int hid = 0;
+        if (read_hdd_seq_sample_and_full(cand->path, cand->frn, cand->size,
+                                         CDC_SCAN_STRONG_CHUNK, strong, full,
+                                         &fid, &hid) == 0) {
+            if (!cand->has_file_id && hid) {
+                cand->file_id = fid;
+                cand->has_file_id = 1;
+            }
+            cand->digests.strong_xxh = cdc_xxh_from_digest32(strong);
+            cand->digests.has_strong_xxh = 1;
+            memcpy(cand->digests.full.bytes, full, 32);
+            cand->digests.has_full = 1;
+            cand->dirty_strong_xxh = 1;
+            cand->dirty_full = 1;
+        }
+    } else {
+        uint8_t digest[32];
+        CdcFileId fid = {0, 0};
+        int hid = 0;
+        if (strong_hash_by_frn(cand->path, cand->frn, cand->size, digest, &fid, &hid) ==
+            0) {
+            if (!cand->has_file_id && hid) {
+                cand->file_id = fid;
+                cand->has_file_id = 1;
+            }
+            cand->digests.strong_xxh = cdc_xxh_from_digest32(digest);
+            cand->digests.has_strong_xxh = 1;
+            cand->dirty_strong_xxh = 1;
+            /* 注意：strong 是 XXH3，full 是 BLAKE3，算法不同，
+             * 不能再像旧版那样把 strong 抄给 full；小文件的
+             * full 在 fast 模式下就缺着，下次常规扫描再补。 */
+        }
+    }
+    call_tick(opts);
+}
+
+/* 常规阶段 2 sample：循环体与改前逐行一致。 */
+static void stage_sample_work(void *ctx, size_t i) {
+    StageParCtx *c = (StageParCtx *)ctx;
+    DupCandidate *cand = &CDC_VEC_AT(c->vec, DupCandidate, i);
+    const CdcScanOpts *opts = c->opts;
+    if (is_cancelled(opts)) return;
+    if (cand->digests.has_sample_xxh || cand->digests.has_full) return;
+    if (!cand->is_ssd && cand->size <= CDC_SCAN_HDD_SEQ_THRESHOLD) {
+        uint8_t sample[32], full[32];
+        CdcFileId fid = {0, 0};
+        int hid = 0;
+        if (read_hdd_seq_sample_and_full(cand->path, cand->frn, cand->size,
+                                         CDC_SCAN_SAMPLE_CHUNK, sample, full,
+                                         &fid, &hid) == 0) {
+            if (!cand->has_file_id && hid) {
+                cand->file_id = fid;
+                cand->has_file_id = 1;
+            }
+            cand->digests.sample_xxh = cdc_xxh_from_digest32(sample);
+            cand->digests.has_sample_xxh = 1;
+            memcpy(cand->digests.full.bytes, full, 32);
+            cand->digests.has_full = 1;
+            cand->dirty_sample_xxh = 1;
+            cand->dirty_full = 1;
+        }
+    } else {
+        uint8_t digest[32];
+        CdcFileId fid = {0, 0};
+        int hid = 0;
+        if (sample_hash_by_frn(cand->path, cand->frn, cand->size, digest, &fid, &hid) ==
+            0) {
+            if (!cand->has_file_id && hid) {
+                cand->file_id = fid;
+                cand->has_file_id = 1;
+            }
+            cand->digests.sample_xxh = cdc_xxh_from_digest32(digest);
+            cand->digests.has_sample_xxh = 1;
+            cand->dirty_sample_xxh = 1;
+            /* 注意：sample 是 XXH3，full 是 BLAKE3，不能再像旧版
+             * 那样把 sample 抄给 full；小文件的 full 留给阶段 3。 */
+        }
+    }
+    call_tick(opts);
+}
+
+/* 探针：循环体与改前逐行一致。 */
+static void stage_probe_work(void *ctx, size_t i) {
+    StageParCtx *c = (StageParCtx *)ctx;
+    DupCandidate *cand = &CDC_VEC_AT(c->vec, DupCandidate, i);
+    const CdcScanOpts *opts = c->opts;
+    if (is_cancelled(opts)) return;
+    uint8_t digest[32];
+    CdcFileId fid = {0, 0};
+    int hid = 0;
+    if (probe_hash_by_frn(cand->path, cand->frn, cand->size, digest, &fid, &hid) == 0) {
+        if (!cand->has_file_id && hid) {
+            cand->file_id = fid;
+            cand->has_file_id = 1;
+        }
+        cand->probe_xxh = cdc_xxh_from_digest32(digest);
+        cand->has_probe = 1;
+    }
+    call_tick(opts);
+}
+
+/* 阶段 3 全哈希：循环体与改前逐行一致。 */
+static void stage_full_work(void *ctx, size_t i) {
+    StageParCtx *c = (StageParCtx *)ctx;
+    DupCandidate *cand = &CDC_VEC_AT(c->vec, DupCandidate, i);
+    const CdcScanOpts *opts = c->opts;
+    if (is_cancelled(opts)) return;
+    if (cand->digests.has_full) return;
+    uint8_t digest[32];
+    CdcFileId fid = {0, 0};
+    int hid = 0;
+    if (full_hash_by_frn(cand->path, cand->frn, digest, &fid, &hid, opts) == 0) {
+        if (!cand->has_file_id && hid) {
+            cand->file_id = fid;
+            cand->has_file_id = 1;
+        }
+        memcpy(cand->digests.full.bytes, digest, 32);
+        cand->digests.has_full = 1;
+        cand->dirty_full = 1;
+    }
+    call_tick(opts);
 }
 
 /* ---------------- 管线（对照 main.rs 的 run_dup_pipeline） ---------------- */
@@ -582,13 +865,13 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
     {
         /* 已有 head 的先 tick（与 Rust 的第一遍循环一致）。 */
         for (size_t i = 0; i < n; i++) {
-            if (items[i].digests.has_head) call_tick(opts);
+            if (items[i].digests.has_head_xxh) call_tick(opts);
         }
         if (!is_cancelled(opts)) {
             /* 卷句柄 LCN 合并直读：按盘符分组，同盘一次调用（内部按偏移合并读）。 */
             size_t n_raw = 0;
             for (size_t i = 0; i < n; i++) {
-                if (!items[i].digests.has_head && items[i].can_raw_read &&
+                if (!items[i].digests.has_head_xxh && items[i].can_raw_read &&
                     items[i].bytes_per_cluster > 0 && items[i].first_lcn > 0)
                     n_raw++;
             }
@@ -603,7 +886,7 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                 if (pairs && targets && results) {
                     size_t t = 0;
                     for (size_t i = 0; i < n; i++) {
-                        if (!items[i].digests.has_head && items[i].can_raw_read &&
+                        if (!items[i].digests.has_head_xxh && items[i].can_raw_read &&
                             items[i].bytes_per_cluster > 0 && items[i].first_lcn > 0) {
                             char ch = items[i].path && items[i].path[0] ? items[i].path[0] : 'C';
                             if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
@@ -647,19 +930,21 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                             opts ? opts->tick_ctx : NULL, results);
                         for (size_t k = 0; k < got; k++) {
                             DupCandidate *c = &items[results[k].idx];
-                            memcpy(c->digests.head.bytes, results[k].digest, 32);
-                            c->digests.has_head = 1;
-                            c->dirty_head = 1;
+                            c->digests.head_xxh =
+                                cdc_xxh_from_digest32(results[k].digest);
+                            c->digests.has_head_xxh = 1;
+                            c->dirty_head_xxh = 1;
                             if (c->size <= CDC_SCAN_HEAD_CHUNK) {
-                                c->digests.sample = c->digests.head;
-                                c->digests.has_sample = 1;
-                                c->digests.strong = c->digests.head;
-                                c->digests.has_strong = 1;
-                                c->digests.full = c->digests.head;
-                                c->digests.has_full = 1;
-                                c->dirty_sample = 1;
-                                c->dirty_strong = 1;
-                                c->dirty_full = 1;
+                                /* head 已覆盖全文：sample/strong 的 XXH3
+                                 * 值与 head 相同（小文件上采样即全文）；
+                                 * full 是 BLAKE3，不能从 xxHash 派生，
+                                 * 留给阶段 3 再算。 */
+                                c->digests.sample_xxh = c->digests.head_xxh;
+                                c->digests.has_sample_xxh = 1;
+                                c->digests.strong_xxh = c->digests.head_xxh;
+                                c->digests.has_strong_xxh = 1;
+                                c->dirty_sample_xxh = 1;
+                                c->dirty_strong_xxh = 1;
                             }
                         }
                         a = b;
@@ -674,7 +959,7 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
         if (!is_cancelled(opts)) {
             size_t n_ssd = 0, n_hdd = 0;
             for (size_t i = 0; i < n; i++) {
-                if (!items[i].digests.has_head) {
+                if (!items[i].digests.has_head_xxh) {
                     if (items[i].is_ssd) n_ssd++;
                     else n_hdd++;
                 }
@@ -686,7 +971,7 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                     size_t s = 0, h = 0;
                     /* SSD 在前（调度序已排好：SSD 段在前）。 */
                     for (size_t i = 0; i < n; i++) {
-                        if (items[i].digests.has_head) continue;
+                        if (items[i].digests.has_head_xxh) continue;
                         CdcIocpRequest *r = &reqs[items[i].is_ssd ? s++ : n_ssd + (h++)];
                         r->idx = i;
                         r->path = items[i].path;
@@ -699,8 +984,9 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                      * 下面直接按 disk 分组调用，不用再排。 */
                     size_t n_res = 0;
                     if (n_ssd > 0) {
+                        /* SSD 批 64 在途（NVMe 放宽；fastio.c 的槽上限已同步到 128）。 */
                         n_res += cdc_iocp_read_heads(
-                            reqs, n_ssd, 32, opts ? opts->cancel : NULL,
+                            reqs, n_ssd, 64, opts ? opts->cancel : NULL,
                             opts ? opts->on_tick : NULL, opts ? opts->tick_ctx : NULL, res);
                     }
                     /* 机械盘按 disk 分组调用。 */
@@ -725,19 +1011,17 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                             c->file_id = res[k].file_id;
                             c->has_file_id = 1;
                         }
-                        memcpy(c->digests.head.bytes, res[k].digest, 32);
-                        c->digests.has_head = 1;
-                        c->dirty_head = 1;
+                        c->digests.head_xxh = cdc_xxh_from_digest32(res[k].digest);
+                        c->digests.has_head_xxh = 1;
+                        c->dirty_head_xxh = 1;
                         if (c->size <= CDC_SCAN_HEAD_CHUNK) {
-                            c->digests.sample = c->digests.head;
-                            c->digests.has_sample = 1;
-                            c->digests.strong = c->digests.head;
-                            c->digests.has_strong = 1;
-                            c->digests.full = c->digests.head;
-                            c->digests.has_full = 1;
-                            c->dirty_sample = 1;
-                            c->dirty_strong = 1;
-                            c->dirty_full = 1;
+                            /* 同上：sample/strong 与 head 同值，full 留给阶段 3。 */
+                            c->digests.sample_xxh = c->digests.head_xxh;
+                            c->digests.has_sample_xxh = 1;
+                            c->digests.strong_xxh = c->digests.head_xxh;
+                            c->digests.has_strong_xxh = 1;
+                            c->dirty_sample_xxh = 1;
+                            c->dirty_strong_xxh = 1;
                         }
                     }
                 }
@@ -762,15 +1046,15 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
         qsort(items, n, sizeof(DupCandidate), cmp_cand_by_head);
         size_t i = 0;
         while (i < n) {
-            if (!items[i].digests.has_head) {
+            if (!items[i].digests.has_head_xxh) {
                 cand_free(&items[i]);
                 i++;
                 continue;
             }
             size_t j = i + 1;
             while (j < n && items[j].size == items[i].size &&
-                   items[j].digests.has_head &&
-                   digest_eq(items[j].digests.head.bytes, items[i].digests.head.bytes))
+                   items[j].digests.has_head_xxh &&
+                   items[j].digests.head_xxh == items[i].digests.head_xxh)
                 j++;
             size_t kept = dedup_hardlinks(&items[i], j - i);
             cdc_vec_t *dst = kept >= 2 ? &stage2 : out_elim;
@@ -792,49 +1076,13 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
     if (opts->fast) {
         /* ---------- 快速模式：strong 即终局 ---------- */
         qsort(stage2.data, stage2.len, sizeof(DupCandidate), cmp_cand_schedule);
-        for (size_t i = 0; i < stage2.len; i++) {
-            DupCandidate *c = &CDC_VEC_AT(&stage2, DupCandidate, i);
-            if (is_cancelled(opts)) break;
-            if (c->digests.has_strong) continue;
-            if (!c->is_ssd && c->size <= CDC_SCAN_HDD_SEQ_THRESHOLD) {
-                uint8_t strong[32], full[32];
-                CdcFileId fid = {0, 0};
-                int hid = 0;
-                if (read_hdd_seq_sample_and_full(c->path, c->frn, c->size,
-                                                 CDC_SCAN_STRONG_CHUNK, strong, full,
-                                                 &fid, &hid) == 0) {
-                    if (!c->has_file_id && hid) {
-                        c->file_id = fid;
-                        c->has_file_id = 1;
-                    }
-                    memcpy(c->digests.strong.bytes, strong, 32);
-                    c->digests.has_strong = 1;
-                    memcpy(c->digests.full.bytes, full, 32);
-                    c->digests.has_full = 1;
-                    c->dirty_strong = 1;
-                    c->dirty_full = 1;
-                }
-            } else {
-                uint8_t digest[32];
-                CdcFileId fid = {0, 0};
-                int hid = 0;
-                if (strong_hash_by_frn(c->path, c->frn, c->size, digest, &fid, &hid) ==
-                    0) {
-                    if (!c->has_file_id && hid) {
-                        c->file_id = fid;
-                        c->has_file_id = 1;
-                    }
-                    memcpy(c->digests.strong.bytes, digest, 32);
-                    c->digests.has_strong = 1;
-                    c->dirty_strong = 1;
-                    if (c->size <= CDC_SCAN_STRONG_CHUNK * 3) {
-                        memcpy(c->digests.full.bytes, digest, 32);
-                        c->digests.has_full = 1;
-                        c->dirty_full = 1;
-                    }
-                }
-            }
-            call_tick(opts);
+        if (stage2.len > 0) {
+            StageParCtx pctx;
+            pctx.vec = &stage2;
+            pctx.opts = opts;
+            cdc_par_for(stage2.len,
+                        cdc_par_hash_workers(stage_vec_all_ssd(&stage2)),
+                        stage_strong_work, &pctx);
         }
         if (is_cancelled(opts)) {
             if (cand_vec_move_all(out_elim, &stage2) != 0) goto done;
@@ -848,48 +1096,12 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
 
     /* ---------- 阶段 2（常规）：sample 16KB×3 ---------- */
     qsort(stage2.data, stage2.len, sizeof(DupCandidate), cmp_cand_schedule);
-    for (size_t i = 0; i < stage2.len; i++) {
-        DupCandidate *c = &CDC_VEC_AT(&stage2, DupCandidate, i);
-        if (is_cancelled(opts)) break;
-        if (c->digests.has_sample || c->digests.has_full) continue;
-        if (!c->is_ssd && c->size <= CDC_SCAN_HDD_SEQ_THRESHOLD) {
-            uint8_t sample[32], full[32];
-            CdcFileId fid = {0, 0};
-            int hid = 0;
-            if (read_hdd_seq_sample_and_full(c->path, c->frn, c->size,
-                                             CDC_SCAN_SAMPLE_CHUNK, sample, full, &fid,
-                                             &hid) == 0) {
-                if (!c->has_file_id && hid) {
-                    c->file_id = fid;
-                    c->has_file_id = 1;
-                }
-                memcpy(c->digests.sample.bytes, sample, 32);
-                c->digests.has_sample = 1;
-                memcpy(c->digests.full.bytes, full, 32);
-                c->digests.has_full = 1;
-                c->dirty_sample = 1;
-                c->dirty_full = 1;
-            }
-        } else {
-            uint8_t digest[32];
-            CdcFileId fid = {0, 0};
-            int hid = 0;
-            if (sample_hash_by_frn(c->path, c->frn, c->size, digest, &fid, &hid) == 0) {
-                if (!c->has_file_id && hid) {
-                    c->file_id = fid;
-                    c->has_file_id = 1;
-                }
-                memcpy(c->digests.sample.bytes, digest, 32);
-                c->digests.has_sample = 1;
-                c->dirty_sample = 1;
-                if (c->size <= CDC_SCAN_SAMPLE_CHUNK * 3) {
-                    memcpy(c->digests.full.bytes, digest, 32);
-                    c->digests.has_full = 1;
-                    c->dirty_full = 1;
-                }
-            }
-        }
-        call_tick(opts);
+    if (stage2.len > 0) {
+        StageParCtx pctx;
+        pctx.vec = &stage2;
+        pctx.opts = opts;
+        cdc_par_for(stage2.len, cdc_par_hash_workers(stage_vec_all_ssd(&stage2)),
+                    stage_sample_work, &pctx);
     }
     if (is_cancelled(opts)) {
         if (cand_vec_move_all(out_elim, &stage2) != 0) goto done;
@@ -902,9 +1114,9 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
     {
         for (size_t i = 0; i < stage2.len; i++) {
             DupCandidate *c = &CDC_VEC_AT(&stage2, DupCandidate, i);
-            if (!c->digests.has_sample && c->digests.has_full) {
+            if (!c->digests.has_sample_xxh && c->digests.has_full) {
                 if (cand_push_move(&stage3, c) != 0) goto done;
-            } else if (!c->digests.has_sample) {
+            } else if (!c->digests.has_sample_xxh) {
                 cand_free(c);
             }
             /* 有 sample 的留在 stage2 里，下面排序分组。 */
@@ -930,8 +1142,8 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
             while (j < stage2.len &&
                    CDC_VEC_AT(&stage2, DupCandidate, j).size ==
                        CDC_VEC_AT(&stage2, DupCandidate, i).size &&
-                   digest_eq(CDC_VEC_AT(&stage2, DupCandidate, j).digests.sample.bytes,
-                             CDC_VEC_AT(&stage2, DupCandidate, i).digests.sample.bytes))
+                   CDC_VEC_AT(&stage2, DupCandidate, j).digests.sample_xxh ==
+                       CDC_VEC_AT(&stage2, DupCandidate, i).digests.sample_xxh)
                 j++;
             cdc_vec_t *dst = (j - i) >= 2 ? &stage3 : out_elim;
             for (size_t k = i; k < j; k++) {
@@ -954,7 +1166,7 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
     {
         for (size_t i = 0; i < stage3.len; i++) {
             DupCandidate *c = &CDC_VEC_AT(&stage3, DupCandidate, i);
-            if (c->size > CDC_SCAN_PROBE_THRESHOLD && c->digests.has_sample) {
+            if (c->size > CDC_SCAN_PROBE_THRESHOLD && c->digests.has_sample_xxh) {
                 if (cand_push_move(&need_probe, c) != 0) goto done;
             } else {
                 if (cand_push_move(&direct, c) != 0) goto done;
@@ -972,8 +1184,8 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
             while (j < need_probe.len &&
                    CDC_VEC_AT(&need_probe, DupCandidate, j).size ==
                        CDC_VEC_AT(&need_probe, DupCandidate, i).size &&
-                   digest_eq(CDC_VEC_AT(&need_probe, DupCandidate, j).digests.sample.bytes,
-                             CDC_VEC_AT(&need_probe, DupCandidate, i).digests.sample.bytes))
+                   CDC_VEC_AT(&need_probe, DupCandidate, j).digests.sample_xxh ==
+                       CDC_VEC_AT(&need_probe, DupCandidate, i).digests.sample_xxh)
                 j++;
             int all_no_full = 1;
             for (size_t k = i; k < j; k++) {
@@ -994,22 +1206,13 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
          * 下面复用 probed 装探完的结果（direct 里的项不动）。 */
         if (probed.len > 0 && !is_cancelled(opts)) {
             qsort(probed.data, probed.len, sizeof(DupCandidate), cmp_cand_schedule);
-            for (size_t k = 0; k < probed.len; k++) {
-                DupCandidate *c = &CDC_VEC_AT(&probed, DupCandidate, k);
-                if (is_cancelled(opts)) break;
-                uint8_t digest[32];
-                CdcFileId fid = {0, 0};
-                int hid = 0;
-                if (probe_hash_by_frn(c->path, c->frn, c->size, digest, &fid, &hid) ==
-                    0) {
-                    if (!c->has_file_id && hid) {
-                        c->file_id = fid;
-                        c->has_file_id = 1;
-                    }
-                    memcpy(c->probe.bytes, digest, 32);
-                    c->has_probe = 1;
-                }
-                call_tick(opts);
+            {
+                StageParCtx pctx;
+                pctx.vec = &probed;
+                pctx.opts = opts;
+                cdc_par_for(probed.len,
+                            cdc_par_hash_workers(stage_vec_all_ssd(&probed)),
+                            stage_probe_work, &pctx);
             }
             if (is_cancelled(opts)) {
                 if (cand_vec_move_all(out_elim, &direct) != 0) goto done;
@@ -1031,8 +1234,7 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
                 while (q < probed.len &&
                        CDC_VEC_AT(&probed, DupCandidate, q).has_probe &&
                        CDC_VEC_AT(&probed, DupCandidate, q).size == c->size &&
-                       digest_eq(CDC_VEC_AT(&probed, DupCandidate, q).probe.bytes,
-                                 c->probe.bytes))
+                       CDC_VEC_AT(&probed, DupCandidate, q).probe_xxh == c->probe_xxh)
                     q++;
                 cdc_vec_t *dst = (q - p) >= 2 ? &direct : out_elim;
                 for (size_t k = p; k < q; k++) {
@@ -1054,23 +1256,12 @@ static int run_dup_pipeline(DupCandidate *items, size_t n, const char *label,
 
     /* ---------- 阶段 3：全文件哈希 ---------- */
     qsort(direct.data, direct.len, sizeof(DupCandidate), cmp_cand_schedule);
-    for (size_t i = 0; i < direct.len; i++) {
-        DupCandidate *c = &CDC_VEC_AT(&direct, DupCandidate, i);
-        if (is_cancelled(opts)) break;
-        if (c->digests.has_full) continue;
-        uint8_t digest[32];
-        CdcFileId fid = {0, 0};
-        int hid = 0;
-        if (full_hash_by_frn(c->path, c->frn, digest, &fid, &hid, opts) == 0) {
-            if (!c->has_file_id && hid) {
-                c->file_id = fid;
-                c->has_file_id = 1;
-            }
-            memcpy(c->digests.full.bytes, digest, 32);
-            c->digests.has_full = 1;
-            c->dirty_full = 1;
-        }
-        call_tick(opts);
+    if (direct.len > 0) {
+        StageParCtx pctx;
+        pctx.vec = &direct;
+        pctx.opts = opts;
+        cdc_par_for(direct.len, cdc_par_hash_workers(stage_vec_all_ssd(&direct)),
+                    stage_full_work, &pctx);
     }
     if (is_cancelled(opts)) {
         if (cand_vec_move_all(out_elim, &direct) != 0) goto done;
@@ -1147,7 +1338,8 @@ static int split_dup_candidates(DupCandidate *cands, size_t n, int fast,
         }
         int all_ready = 1, all_ssd = 1;
         for (size_t k = i; k < j; k++) {
-            int has_final = fast ? cands[k].digests.has_strong : cands[k].digests.has_full;
+            int has_final =
+                fast ? cands[k].digests.has_strong_xxh : cands[k].digests.has_full;
             if (!has_final) all_ready = 0;
             if (!cands[k].is_ssd) all_ssd = 0;
         }
@@ -1221,8 +1413,22 @@ static int run_dup_pipelines(cdc_vec_t *ssd_stage1, cdc_vec_t *mixed_stage1,
 
 /* ---------------- 建组（对照 main.rs 的 build_dup_groups / sort_dup_groups） ---------------- */
 
-static const uint8_t *final_digest_bytes(const DupCandidate *c, int fast) {
-    return fast ? c->digests.strong.bytes : c->digests.full.bytes;
+/* 终局摘要相等比较：fast 模式比 strong_xxh（uint64），常规比 full（32 字节）。 */
+static int final_digest_eq(const DupCandidate *a, const DupCandidate *b, int fast) {
+    if (fast) return a->digests.strong_xxh == b->digests.strong_xxh;
+    return digest_eq(a->digests.full.bytes, b->digests.full.bytes);
+}
+
+/* 终局摘要写组 key：fast 模式为 strong_xxh 的 16 位 hex，
+ * 常规为 full 的 64 位 hex；hash_hex[65] 都装得下。 */
+static void final_digest_hex(const DupCandidate *c, int fast, char out[65]) {
+    if (fast) {
+        char tmp[17];
+        cdc_xxh_to_hex(c->digests.strong_xxh, tmp);
+        strcpy(out, tmp);
+    } else {
+        cdc_digest_to_hex(&c->digests.full, out);
+    }
 }
 
 static int cmp_cand_by_path(const void *a, const void *b) {
@@ -1252,7 +1458,8 @@ static int build_dup_groups(DupCandidate *items, size_t n, int fast,
     int rc = 0;
     size_t w = 0;
     for (size_t i = 0; i < n; i++) {
-        int has_final = fast ? items[i].digests.has_strong : items[i].digests.has_full;
+        int has_final =
+            fast ? items[i].digests.has_strong_xxh : items[i].digests.has_full;
         if (!has_final) {
             cand_free(&items[i]);
             continue;
@@ -1271,8 +1478,7 @@ static int build_dup_groups(DupCandidate *items, size_t n, int fast,
     while (i < n) {
         size_t j = i + 1;
         while (j < n && items[j].size == items[i].size &&
-               digest_eq(final_digest_bytes(&items[j], fast),
-                         final_digest_bytes(&items[i], fast)))
+               final_digest_eq(&items[j], &items[i], fast))
             j++;
         if (j - i >= 2) {
             for (size_t k = i; k < j; k++) {
@@ -1289,11 +1495,7 @@ static int build_dup_groups(DupCandidate *items, size_t n, int fast,
                 qsort(&items[i], kept, sizeof(DupCandidate), cmp_cand_by_path);
                 CdcDupGroup g;
                 memset(&g, 0, sizeof g);
-                {
-                    cdc_digest_t d;
-                    memcpy(d.bytes, final_digest_bytes(&items[i], fast), 32);
-                    cdc_digest_to_hex(&d, g.hash_hex);
-                }
+                final_digest_hex(&items[i], fast, g.hash_hex);
                 g.size = items[i].size;
                 g.files = malloc(kept * sizeof(char *));
                 g.mtimes = malloc(kept * sizeof(uint64_t));
@@ -1380,6 +1582,19 @@ int cdc_scan_hash_groups(const cdc_scan_input_t *inputs, size_t n,
                 if (!c.digests.has_strong && ce.has_strong) {
                     c.digests.has_strong = 1;
                     c.digests.strong = ce.strong;
+                }
+                /* 采样层只看 xxh 字段（旧版 BLAKE3 的三档只透传、不用于跳过）。 */
+                if (!c.digests.has_head_xxh && ce.has_head_xxh) {
+                    c.digests.has_head_xxh = 1;
+                    c.digests.head_xxh = ce.head_xxh;
+                }
+                if (!c.digests.has_sample_xxh && ce.has_sample_xxh) {
+                    c.digests.has_sample_xxh = 1;
+                    c.digests.sample_xxh = ce.sample_xxh;
+                }
+                if (!c.digests.has_strong_xxh && ce.has_strong_xxh) {
+                    c.digests.has_strong_xxh = 1;
+                    c.digests.strong_xxh = ce.strong_xxh;
                 }
                 if (!c.digests.has_full && ce.has_full) {
                     c.digests.has_full = 1;
@@ -1551,7 +1766,7 @@ int cdc_scan_big(const char **drives, size_t n_drives, const CdcScanOpts *opts,
     size_t n_use = n_drives;
     if (n_drives == 0) {
         size_t nf = 0;
-        cdc_fixed_drives(fixed, 26, &nf);
+        cdc_fixed_drives_buf(fixed, 26, &nf);
         for (size_t i = 0; i < nf; i++) fixed_ptrs[i] = fixed[i];
         use = fixed_ptrs;
         n_use = nf;
@@ -1599,7 +1814,7 @@ int cdc_scan_dups(const char **roots, size_t n_roots, uint64_t min_size,
     size_t n_use = n_roots;
     if (n_roots == 0) {
         size_t nf = 0;
-        cdc_fixed_drives(fixed, 26, &nf);
+        cdc_fixed_drives_buf(fixed, 26, &nf);
         for (size_t i = 0; i < nf; i++) fixed_ptrs[i] = fixed[i];
         use_roots = fixed_ptrs;
         n_use = nf;
@@ -1771,7 +1986,7 @@ int cdc_scan_dups(const char **roots, size_t n_roots, uint64_t min_size,
     }
     for (size_t k = 0; k < final_items.len; k++) {
         DupCandidate *c = &CDC_VEC_AT(&final_items, DupCandidate, k);
-        int has_final = opts->fast ? c->digests.has_strong : c->digests.has_full;
+        int has_final = opts->fast ? c->digests.has_strong_xxh : c->digests.has_full;
         if (has_final) {
             if (cand_push_move(&ready, c) != 0) {
                 cand_vec_free_all(&ready);
@@ -1821,7 +2036,7 @@ uint64_t cdc_file_mtime(const char *path) {
 #endif
 }
 
-int cdc_fixed_drives(char (*drives)[4], size_t cap, size_t *out_n) {
+int cdc_fixed_drives_buf(char (*drives)[4], size_t cap, size_t *out_n) {
     if (out_n) *out_n = 0;
     if (!drives || cap == 0) return 0;
 #ifdef _WIN32

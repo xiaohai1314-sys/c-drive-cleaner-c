@@ -62,17 +62,6 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
-/* 仅 Windows 的 resolve_dir 用（Linux 下不编译，否则 -Werror=unused-function）。 */
-#ifdef _WIN32
-static char *xstrndup(const char *s, size_t n) {
-    char *p = xmalloc(n + 1);
-    if (!p) return NULL;
-    memcpy(p, s, n);
-    p[n] = '\0';
-    return p;
-}
-#endif
-
 /* ASCII 小写比较（skip_top 表全是 ASCII，与 Rust 的 to_lowercase 在这批词上等价）。 */
 static int ascii_lower_eq(const char *a, const char *b) {
     while (*a && *b) {
@@ -1055,13 +1044,19 @@ static void mem_snapshot_put(uint64_t serial, SnapInternal *snap) {
 /* resolve 缓存里"已解析为无"的哨兵（有效路径永不为空串）。 */
 static const char g_resolve_none[] = "";
 
-static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
-                         const char *drive, int skip_top_at_root,
-                         const char *const *skip_top, size_t n_skip) {
+/* 目录路径解析：返回缓存内字符串的借用指针（调用期间有效，调用方
+ * 不得 free、不得修改）；未解析出返回 NULL。
+ * 缓存每 FRN 存一份完整路径；借用路径省掉"命中缓存还要 xstrdup
+ * 一份"的逐条拷贝（主循环每条记录一次）。需要长期持有的调用方
+ * 用下面的 resolve_dir（独立拷贝）。 */
+static const char *resolve_dir_borrowed(uint64_t frn, SnapInternal *snap,
+                                        CdcU64Map *cache, const char *drive,
+                                        int skip_top_at_root,
+                                        const char *const *skip_top, size_t n_skip) {
     uintptr_t cv = 0;
     if (u64map_get(cache, frn, &cv)) {
         if (cv == (uintptr_t)g_resolve_none) return NULL;
-        return xstrdup((const char *)cv);
+        return (const char *)cv;
     }
     uint64_t root_idx = frn & 0xFFFFFFFFFFFFULL;
     if (root_idx == 5) {
@@ -1069,19 +1064,19 @@ static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
         char *p = xmalloc(n);
         if (!p) return NULL;
         snprintf(p, n, "%s\\", drive);
-        u64map_put(cache, frn, (uintptr_t)xstrdup(p));
+        u64map_put(cache, frn, (uintptr_t)p);
         return p;
     }
 
     cdc_vec_t chain;
     if (cdc_vec_init(&chain, sizeof(uint64_t)) != CDC_OK) return NULL;
     uint64_t cur_frn = frn;
-    char *base = NULL;
+    const char *base = NULL;
 
     while (1) {
         if (u64map_get(cache, cur_frn, &cv)) {
             if (cv == (uintptr_t)g_resolve_none) break;
-            base = xstrdup((const char *)cv);
+            base = (const char *)cv; /* 已入缓存，借用 */
             break;
         }
         uint64_t cur_idx = cur_frn & 0xFFFFFFFFFFFFULL;
@@ -1094,10 +1089,11 @@ static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
         if (node->parent_frn == 0 || parent_idx == 5) {
             if (skip_top_at_root && name_in_skip_top(node->name, skip_top, n_skip)) break;
             size_t n = strlen(drive) + 1 + strlen(node->name) + 1;
-            base = xmalloc(n);
-            if (!base) break;
-            snprintf(base, n, "%s\\%s", drive, node->name);
-            u64map_put(cache, cur_frn, (uintptr_t)xstrdup(base));
+            char *b = xmalloc(n);
+            if (!b) break;
+            snprintf(b, n, "%s\\%s", drive, node->name);
+            u64map_put(cache, cur_frn, (uintptr_t)b);
+            base = b; /* 刚入缓存，借用 */
             break;
         }
         if (cdc_vec_push(&chain, &cur_frn) != CDC_OK) break;
@@ -1113,7 +1109,20 @@ static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
         return NULL;
     }
 
-    char *path = base;
+    if (chain.len == 0) {
+        /* base 已入缓存，直接借用（无拷贝）。 */
+        cdc_vec_free(&chain);
+        return base;
+    }
+
+    /* 组装：base 已入缓存，不能原地改，先拷一份工作串；每段拼完后
+     * 把当前完整路径存一份进缓存；最后一段（frn 本身）直接把工作串
+     * 入缓存、不另拷贝，返回的即缓存串。 */
+    char *path = xstrdup(base);
+    if (!path) {
+        cdc_vec_free(&chain);
+        return NULL;
+    }
     for (size_t ri = chain.len; ri-- > 0;) {
         uint64_t idx = CDC_VEC_AT(&chain, uint64_t, ri) & 0xFFFFFFFFFFFFULL;
         CdcDirNode *node = snap_dir_get(snap, idx);
@@ -1137,10 +1146,26 @@ static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
         memcpy(np + plen + 1, node->name, strlen(node->name) + 1);
         free(path);
         path = np;
-        u64map_put(cache, CDC_VEC_AT(&chain, uint64_t, ri), (uintptr_t)xstrdup(path));
+        if (ri == 0) {
+            u64map_put(cache, CDC_VEC_AT(&chain, uint64_t, ri), (uintptr_t)path);
+        } else {
+            char *cached = xstrdup(path);
+            if (cached)
+                u64map_put(cache, CDC_VEC_AT(&chain, uint64_t, ri), (uintptr_t)cached);
+        }
     }
     cdc_vec_free(&chain);
     return path;
+}
+
+/* resolve_dir_borrowed 的独立拷贝版（调用方 free）：供需要长期持有
+ * 字符串的调用方（USN 第 2 遍的改名新旧路径，缓存释放后仍在用）。 */
+static char *resolve_dir(uint64_t frn, SnapInternal *snap, CdcU64Map *cache,
+                         const char *drive, int skip_top_at_root,
+                         const char *const *skip_top, size_t n_skip) {
+    const char *borrowed = resolve_dir_borrowed(frn, snap, cache, drive,
+                                                skip_top_at_root, skip_top, n_skip);
+    return borrowed ? xstrdup(borrowed) : NULL;
 }
 
 #endif /* _WIN32 */
@@ -1778,6 +1803,46 @@ static void resolve_cache_free(CdcU64Map *cache) {
     u64map_free(cache);
 }
 
+/* 逐字符小写前缀比较：full 的前 n 个字节与小写的 prefix 相等
+ * （prefix 须事先小写；ASCII 大小写差 32，逐字符就地小写等价于整串
+ * ascii_lower_in_place 后比较，但不另分配拷贝）。full 短于 n 时
+ * 读到 NUL 即返回 0（不是前缀），不越界。 */
+static int lower_is_prefix(const char *full, const char *prefix, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char a = (unsigned char)full[i];
+        if (a == '\0') return 0;
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+        if (a != (unsigned char)prefix[i]) return 0;
+    }
+    return 1;
+}
+
+/* rest（已去掉 root 前缀，指向 full 串内的第一段）与 skip_top 逐段
+ * 比较：只读第一段，不拷贝、不分配；两侧逐字符就地小写。 */
+static int lower_has_skip_segment(const char *rest,
+                                  const char *const *skip_top, size_t n_skip) {
+    const char *slash = strchr(rest, '\\');
+    size_t seg = slash ? (size_t)(slash - rest) : strlen(rest);
+    for (size_t i = 0; i < n_skip; i++) {
+        size_t k = strlen(skip_top[i]);
+        size_t j;
+        int eq = 1;
+        if (k != seg) continue;
+        for (j = 0; j < k; j++) {
+            unsigned char a = (unsigned char)rest[j];
+            unsigned char b = (unsigned char)skip_top[i][j];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+            if (a != b) {
+                eq = 0;
+                break;
+            }
+        }
+        if (eq) return 1;
+    }
+    return 0;
+}
+
 int cdc_mft_try_scan(const char *root, uint64_t min_size,
                      const char *const *skip_top, size_t n_skip,
                      cdc_keep_fn keep, void *keep_ctx, CdcFileEntryList *out) {
@@ -1968,18 +2033,16 @@ int cdc_mft_try_scan(const char *root, uint64_t min_size,
         if (raw->size < min_size) continue;
         if (keep && !keep(raw->name, raw->size, keep_ctx)) continue;
         uint64_t parent_idx = raw->parent_frn & 0xFFFFFFFFFFFFULL;
-        char *dir_path = NULL;
+        /* dir_path 是借用指针（resolve 缓存内字符串，或栈上的盘根），
+         * 本次迭代内有效，调用方不 free。 */
+        const char *dir_path;
+        char drive_root[64]; /* "C:\" 形，栈上足够 */
         if (parent_idx == 5) {
-            size_t n = strlen(drive) + 2;
-            dir_path = xmalloc(n);
-            if (!dir_path) {
-                rc = -1;
-                break;
-            }
-            snprintf(dir_path, n, "%s\\", drive);
+            snprintf(drive_root, sizeof drive_root, "%s\\", drive);
+            dir_path = drive_root;
         } else {
-            dir_path = resolve_dir(raw->parent_frn, snap, &dir_cache, drive, is_drive_root,
-                                   skip_top, n_skip);
+            dir_path = resolve_dir_borrowed(raw->parent_frn, snap, &dir_cache,
+                                            drive, is_drive_root, skip_top, n_skip);
             if (!dir_path) continue;
         }
         size_t dl = strlen(dir_path);
@@ -1987,7 +2050,6 @@ int cdc_mft_try_scan(const char *root, uint64_t min_size,
         size_t n = dl + (size_t)(need_sep ? 1 : 0) + strlen(raw->name) + 1;
         char *full = xmalloc(n);
         if (!full) {
-            free(dir_path);
             rc = -1;
             break;
         }
@@ -1995,28 +2057,17 @@ int cdc_mft_try_scan(const char *root, uint64_t min_size,
             snprintf(full, n, "%s\\%s", dir_path, raw->name);
         else
             snprintf(full, n, "%s%s", dir_path, raw->name);
-        free(dir_path);
         if (!is_drive_root) {
-            char *lower = xstrdup(full);
-            if (!lower) {
-                free(full);
-                rc = -1;
-                break;
-            }
-            ascii_lower_in_place(lower);
+            /* 与旧实现同款判定，但不拷贝 lower、不截段串：前缀与首段
+             * 都逐字符比（full 原串不改，比较时就地小写）。 */
             int skip = 0;
-            if (strncmp(lower, root_lower, strlen(root_lower)) != 0 ||
-                lower[strlen(root_lower)] != '\\') {
+            if (!lower_is_prefix(full, root_lower, strlen(root_lower)) ||
+                full[strlen(root_lower)] != '\\') {
                 skip = 1;
-            } else if (strlen(lower) > root_len) {
-                const char *rest = lower + root_len;
-                const char *slash = strchr(rest, '\\');
-                size_t seg = slash ? (size_t)(slash - rest) : strlen(rest);
-                char *segstr = xstrndup(rest, seg);
-                if (segstr && name_in_skip_top(segstr, skip_top, n_skip)) skip = 1;
-                free(segstr);
+            } else if (strlen(full) > root_len) {
+                if (lower_has_skip_segment(full + root_len, skip_top, n_skip))
+                    skip = 1;
             }
-            free(lower);
             if (skip) {
                 free(full);
                 continue;
@@ -2291,14 +2342,16 @@ int cdc_usn_changes_since(const char *root, uint64_t stored_journal_id,
         for (size_t i = 0; i < file_recs_v.len; i++) {
             CdcRawFile *raw = &CDC_VEC_AT(&file_recs_v, CdcRawFile, i);
             uint64_t parent = raw->parent_frn & 0xFFFFFFFFFFFFULL;
-            char *dir_path = NULL;
+            /* dir_path 是借用指针（resolve 缓存内字符串，或栈上的盘根），
+             * 本次迭代内有效，调用方不 free。 */
+            const char *dir_path = NULL;
+            char drive_root[64]; /* "C:\" 形，栈上足够 */
             if (parent == 5) {
-                size_t n = strlen(drive) + 2;
-                dir_path = xmalloc(n);
-                if (dir_path) snprintf(dir_path, n, "%s\\", drive);
+                snprintf(drive_root, sizeof drive_root, "%s\\", drive);
+                dir_path = drive_root;
             } else {
-                dir_path = resolve_dir(raw->parent_frn, dirs, &dir_cache, drive, 1,
-                                       skip_top, n_skip);
+                dir_path = resolve_dir_borrowed(raw->parent_frn, dirs, &dir_cache,
+                                                drive, 1, skip_top, n_skip);
             }
             if (!dir_path) {
                 uint64_t gone = raw->frn & 0xFFFFFFFFFFFFULL;
@@ -2313,7 +2366,6 @@ int cdc_usn_changes_since(const char *root, uint64_t stored_journal_id,
             size_t n = dl + (size_t)(need_sep ? 1 : 0) + strlen(raw->name) + 1;
             char *full = xmalloc(n);
             if (!full) {
-                free(dir_path);
                 rc = -1;
                 break;
             }
@@ -2321,7 +2373,6 @@ int cdc_usn_changes_since(const char *root, uint64_t stored_journal_id,
                 snprintf(full, n, "%s\\%s", dir_path, raw->name);
             else
                 snprintf(full, n, "%s%s", dir_path, raw->name);
-            free(dir_path);
             CdcUsnChangedFile cf;
             cf.frn = raw->frn;
             cf.path = full;
@@ -2463,75 +2514,100 @@ static char *join_path(const char *dir, const char *name) {
     return p;
 }
 
-#ifndef _WIN32
+typedef struct {
+    WalkStack *st;
+    CdcFileEntryList *out;
+    uint64_t min_size;
+    const char *const *skip_top;
+    size_t n_skip;
+    const char *cur_path; /* 当前目录（借用，不拥有） */
+    int cur_is_top;
+} WalkCbCtx;
 
+/* 回调返回 0 继续、-1 致命错误（NOMEM）；cdc_enum_dir 原样返回它。
+ * 过滤语义与旧的两份实现逐项一致：跳过 "$" 开头名、不跟随链接
+ * （POSIX 符号链接 / Windows 重解析点）、Windows 再跳过离线/
+ * 按需取回属性；顶层目录才比 skip_top。 */
+static int walk_enum_cb(const char *name, int is_dir, int is_symlink, uint64_t size,
+                        uint64_t mtime, uint32_t attrs, void *ctx) {
+    WalkCbCtx *c = (WalkCbCtx *)ctx;
+    char *full;
+    if (name[0] == '$') return 0;
+    if (is_symlink) return 0; /* 不跟随链接 */
+#ifdef _WIN32
+    if ((attrs & CDC_MFT_SKIP_FILE_ATTRS) != 0) return 0; /* 离线/按需取回 */
+#else
+    (void)attrs;
+#endif
+    full = join_path(c->cur_path, name);
+    if (!full) return -1;
+    if (is_dir) {
+        if (c->cur_is_top && name_in_skip_top(name, c->skip_top, c->n_skip)) {
+            free(full);
+            return 0;
+        }
+        if (walk_stack_push(c->st, full, 0) != 0) {
+            free(full);
+            return -1;
+        }
+        free(full);
+        return 0;
+    }
+    if (size >= c->min_size) {
+        CdcFileEntry en;
+        en.path = full;
+        en.size = size;
+        en.mtime = mtime;
+        en.sort_key = 0;
+        en.frn = 0;
+        en.first_lcn = 0;
+        en.bytes_per_cluster = 0;
+        en.can_raw_read = 0;
+        if (entry_list_push(c->out, en) != 0) {
+            free(full);
+            return -1;
+        }
+        return 0;
+    }
+    free(full);
+    return 0;
+}
+
+/* 单一实现走 cdc_enum_dir（util.c）：Windows 用 NtQueryDirectoryFile
+ * 批量取，POSIX 用 opendir/readdir。打不开的目录静默跳过。 */
 int cdc_fallback_walk_files(const char *root, uint64_t min_size,
                             const char *const *skip_top, size_t n_skip,
                             CdcFileEntryList *out) {
     WalkStack st;
+    WalkCbCtx ctx;
+    int rc = 0;
     memset(&st, 0, sizeof st);
     if (cdc_vec_init(&st.vec, sizeof(WalkDir)) != CDC_OK) return -1;
     if (walk_stack_push(&st, root, 1) != 0) {
         cdc_vec_free(&st.vec);
         return -1;
     }
-    int rc = 0;
+    ctx.st = &st;
+    ctx.out = out;
+    ctx.min_size = min_size;
+    ctx.skip_top = skip_top;
+    ctx.n_skip = n_skip;
+    ctx.cur_path = NULL;
+    ctx.cur_is_top = 0;
     while (st.vec.len > 0) {
         WalkDir cur;
+        int r;
         cdc_vec_pop(&st.vec, &cur);
-        DIR *d = opendir(cur.path);
-        if (!d) {
-            free(cur.path);
-            continue;
-        }
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-            if (e->d_name[0] == '$') continue;
-            char *full = join_path(cur.path, e->d_name);
-            if (!full) {
-                rc = -1;
-                break;
-            }
-            struct stat stbuf;
-            if (lstat(full, &stbuf) != 0) {
-                free(full);
-                continue;
-            }
-            if (S_ISLNK(stbuf.st_mode)) {
-                /* 回退层面的重解析点等价物：不跟随符号链接。 */
-                free(full);
-                continue;
-            }
-            if (S_ISDIR(stbuf.st_mode)) {
-                if (cur.is_top && name_in_skip_top(e->d_name, skip_top, n_skip)) {
-                    free(full);
-                    continue;
-                }
-                if (walk_stack_push(&st, full, 0) != 0) rc = -1;
-                free(full);
-            } else if (S_ISREG(stbuf.st_mode) && (uint64_t)stbuf.st_size >= min_size) {
-                CdcFileEntry en;
-                en.path = full;
-                en.size = (uint64_t)stbuf.st_size;
-                en.mtime = (uint64_t)stbuf.st_mtime;
-                en.sort_key = 0;
-                en.frn = 0;
-                en.first_lcn = 0;
-                en.bytes_per_cluster = 0;
-                en.can_raw_read = 0;
-                if (entry_list_push(out, en) != 0) {
-                    free(full);
-                    rc = -1;
-                    break;
-                }
-            } else {
-                free(full);
-            }
-        }
-        closedir(d);
+        ctx.cur_path = cur.path;
+        ctx.cur_is_top = cur.is_top;
+        r = cdc_enum_dir(cur.path, walk_enum_cb, &ctx);
         free(cur.path);
-        if (rc != 0) break;
+        /* 打开失败（缺失/不可读）的目录直接跳过，与旧实现一致；
+         * 其它返回（回调 -1、NOMEM）为致命错误。 */
+        if (r != CDC_OK && r != CDC_ERR_NOT_FOUND && r != CDC_ERR_IO) {
+            rc = -1;
+            break;
+        }
     }
     while (st.vec.len > 0) {
         WalkDir wd;
@@ -2541,113 +2617,6 @@ int cdc_fallback_walk_files(const char *root, uint64_t min_size,
     cdc_vec_free(&st.vec);
     return rc;
 }
-
-#else /* _WIN32 */
-
-int cdc_fallback_walk_files(const char *root, uint64_t min_size,
-                            const char *const *skip_top, size_t n_skip,
-                            CdcFileEntryList *out) {
-    WalkStack st;
-    memset(&st, 0, sizeof st);
-    if (cdc_vec_init(&st.vec, sizeof(WalkDir)) != CDC_OK) return -1;
-    if (walk_stack_push(&st, root, 1) != 0) {
-        cdc_vec_free(&st.vec);
-        return -1;
-    }
-    int rc = 0;
-    while (st.vec.len > 0) {
-        WalkDir cur;
-        cdc_vec_pop(&st.vec, &cur);
-        char *pattern = join_path(cur.path, "*");
-        if (!pattern) {
-            free(cur.path);
-            rc = -1;
-            break;
-        }
-        wchar_t *wpat = cdc_utf8_to_wide(pattern);
-        free(pattern);
-        if (!wpat) {
-            free(cur.path);
-            rc = -1;
-            break;
-        }
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW(wpat, &fd);
-        free(wpat);
-        if (h == INVALID_HANDLE_VALUE) {
-            free(cur.path);
-            continue;
-        }
-        do {
-            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
-                continue;
-            if (fd.cFileName[0] == L'$') continue;
-            char *name = cdc_wide_to_utf8(fd.cFileName);
-            if (!name) {
-                rc = -1;
-                break;
-            }
-            char *full = join_path(cur.path, name);
-            free(name);
-            if (!full) {
-                rc = -1;
-                break;
-            }
-            if (fd.dwFileAttributes & CDC_MFT_SKIP_FILE_ATTRS) {
-                free(full);
-                continue;
-            }
-            int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            if (is_dir) {
-                if (cur.is_top) {
-                    char *base = full;
-                    for (const char *p = full; *p; p++)
-                        if (*p == '/' || *p == '\\') base = (char *)p + 1;
-                    if (name_in_skip_top(base, skip_top, n_skip)) {
-                        free(full);
-                        continue;
-                    }
-                }
-                if (walk_stack_push(&st, full, 0) != 0) rc = -1;
-                free(full);
-            } else {
-                uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                if (size >= min_size) {
-                    uint64_t ft = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) |
-                                  fd.ftLastWriteTime.dwLowDateTime;
-                    CdcFileEntry en;
-                    en.path = full;
-                    en.size = size;
-                    en.mtime = mft_filetime_to_unix(ft);
-                    en.sort_key = 0;
-                    en.frn = 0;
-                    en.first_lcn = 0;
-                    en.bytes_per_cluster = 0;
-                    en.can_raw_read = 0;
-                    if (entry_list_push(out, en) != 0) {
-                        free(full);
-                        rc = -1;
-                        break;
-                    }
-                } else {
-                    free(full);
-                }
-            }
-        } while (rc == 0 && FindNextFileW(h, &fd));
-        FindClose(h);
-        free(cur.path);
-        if (rc != 0) break;
-    }
-    while (st.vec.len > 0) {
-        WalkDir wd;
-        cdc_vec_pop(&st.vec, &wd);
-        free(wd.path);
-    }
-    cdc_vec_free(&st.vec);
-    return rc;
-}
-
-#endif /* _WIN32 */
 
 int cdc_scan_files(const char *root, uint64_t min_size,
                    const char *const *skip_top, size_t n_skip,

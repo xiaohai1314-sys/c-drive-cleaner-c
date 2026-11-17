@@ -133,51 +133,60 @@ static char *path_join2(const char *a, const char *b) {
     return cdc_buf_take_cstr(&buf);
 }
 
-/* 列出目录下的直接子项名（不递归；Linux 用 opendir，与 Windows
- * FindFirstFileW 的语义一致：返回名，不含 "." ".."）。 */
+/* 本地 strdup（malloc 版；与 safety.c / mft.c 各自的 static 同款，
+ * 不用 libc strdup，避免 MSVC C4996）。 */
+static char *xstrdup(const char *s) {
+    size_t n;
+    char *p;
+    if (!s) return NULL;
+    n = strlen(s) + 1;
+    p = (char *)malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+/* 列出目录下的直接子项名（不递归；走 util.c 的 cdc_enum_dir，与旧
+ * 实现同语义：返回名，不含 "." ".."；不存在/不可读 = 空）。
+ * 名字解码失败的项：旧 Windows 版静默跳过（cdc_wide_to_utf8 返回
+ * NULL），新实现按 U+FFFD 替换后收录（与 cdc_wide_to_utf8 同策略，
+ * 调用方只拿名做存在性比对，替换后的名匹配不上，无行为变化）。 */
+typedef struct {
+    cdc_vec_t *names;
+} ListNamesCtx;
+
+static int list_names_cb(const char *name, int is_dir, int is_symlink, uint64_t size,
+                         uint64_t mtime, uint32_t attrs, void *ctx) {
+    ListNamesCtx *c = (ListNamesCtx *)ctx;
+    char *u;
+    (void)is_dir;
+    (void)is_symlink;
+    (void)size;
+    (void)mtime;
+    (void)attrs;
+    u = xstrdup(name);
+    if (!u) return 0; /* 内存不足：跳过本项（旧实现同款：push 失败即丢弃） */
+    if (cdc_vec_push(c->names, &u) != CDC_OK) {
+        free(u);
+        return 0;
+    }
+    return 0;
+}
+
 static int list_dir_names(const char *dir, char ***out, size_t *out_n) {
     *out = NULL;
     *out_n = 0;
     cdc_vec_t names;
+    ListNamesCtx c;
+    int rc;
     if (cdc_vec_init(&names, sizeof(char *)) != CDC_OK) return CDC_ERR_NOMEM;
-#ifdef _WIN32
-    char *pat = path_join2(dir, "*");
-    wchar_t *wpat = cdc_utf8_to_wide(pat);
-    free(pat);
-    if (!wpat) {
+    c.names = &names;
+    rc = cdc_enum_dir(dir, list_names_cb, &c);
+    /* 不存在/不可读 = 空（旧实现同款：两平台都返回 OK）。 */
+    if (rc == CDC_ERR_NOT_FOUND || rc == CDC_ERR_IO) rc = CDC_OK;
+    if (rc != CDC_OK) {
         cdc_vec_free(&names);
-        return CDC_ERR_UTF8;
+        return rc;
     }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(wpat, &fd);
-    free(wpat);
-    if (h == INVALID_HANDLE_VALUE) {
-        cdc_vec_free(&names);
-        return CDC_OK; /* 不存在/不可读 = 空 */
-    }
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 ||
-            wcscmp(fd.cFileName, L"..") == 0)
-            continue;
-        char *u = cdc_wide_to_utf8(fd.cFileName);
-        if (u && cdc_vec_push(&names, &u) != CDC_OK) free(u);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-#else
-    DIR *d = opendir(dir);
-    if (!d) {
-        cdc_vec_free(&names);
-        return CDC_OK;
-    }
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
-            continue;
-        char *u = strdup(e->d_name);
-        if (u && cdc_vec_push(&names, &u) != CDC_OK) free(u);
-    }
-    closedir(d);
-#endif
     *out = (char **)names.data;
     *out_n = names.len;
     names.data = NULL;

@@ -1159,7 +1159,9 @@ static int write_journal(const char *source, const char *backup,
     if (rc != CDC_OK) {
         /* create_new 失败：Rust 映射 AlreadyExists（文件已存在时
          * create_new 返回 AlreadyExists）。 */
-        free(text);
+        /* text 是 cJSON_PrintUnformatted 的返回值，用 cJSON_free 释放
+         *（cJSON 自身的 free 钩子，不依赖本文件是否走 mimalloc 全局替换）。 */
+        cJSON_free(text);
         free(path);
         free(cache);
         if (err) *err = e;
@@ -1173,7 +1175,7 @@ static int write_journal(const char *source, const char *backup,
 #endif
     cdc_handle_chain_free(chain);
     free(chain);
-    free(text);
+    cJSON_free(text);
     if (wrc != CDC_OK) {
         cdc_delete_file_checked(path, roots, 1, 0, NULL);
         free(path);

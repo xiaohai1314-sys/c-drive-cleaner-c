@@ -13,6 +13,11 @@
  *     行为一致；dirty 记在条目上，不另建集合。
  *   - 打开失败也返回可用的空缓存（与 Rust load_for_paths_at 一致），
  *     save_dirty 时再重试打开。
+ *   - 采样层摘要（XXH3-64）存在 head_xxh / sample_xxh / strong_xxh
+ *     三列（INTEGER，按位存 uint64），不进 BLAKE3 的 BLOB 列：
+ *     与 Rust 版共用同一个 hash-cache-v3.db，Rust 读自己那几列不
+ *     受影响；旧库（Rust 或旧版 C 建的表）打开时 ALTER TABLE 补列。
+ *     full 仍是 BLAKE3，值保持兼容。
  */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -92,6 +97,11 @@ static int entry_insert_at(cdc_hashcache_t *c, size_t pos, CdcHashEntry *e) {
     arr[pos] = *e;
     c->entries.len++;
     return 0;
+}
+
+/* 路径指针的 strcmp 比较（qsort 用，见 load_at）。 */
+static int cmp_path_ptr(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
 }
 
 /* ---------------- hex ---------------- */
@@ -205,6 +215,9 @@ static int open_conn(const char *db_path, sqlite3 **out_db) {
         "    sample BLOB,"
         "    strong BLOB,"
         "    full BLOB,"
+        "    head_xxh INTEGER,"
+        "    sample_xxh INTEGER,"
+        "    strong_xxh INTEGER,"
         "    last_seen INTEGER NOT NULL"
         ") WITHOUT ROWID;"
         "CREATE INDEX IF NOT EXISTS idx_hashes_last_seen ON file_hashes(last_seen);";
@@ -213,6 +226,27 @@ static int open_conn(const char *db_path, sqlite3 **out_db) {
         sqlite3_free(emsg);
         sqlite3_close(db);
         return -1;
+    }
+    /* 旧库补列：表可能是 Rust 版或旧版 C 建的（只有 7 列），
+     * CREATE TABLE IF NOT EXISTS 不会补新列，这里按需 ALTER。 */
+    static const char *XXH_COLS[3] = {"head_xxh", "sample_xxh", "strong_xxh"};
+    for (int i = 0; i < 3; i++) {
+        sqlite3_stmt *ck = NULL;
+        char sql[128];
+        snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM pragma_table_info('file_hashes')"
+                                  " WHERE name = '%s'",
+                 XXH_COLS[i]);
+        int has = 0;
+        if (sqlite3_prepare_v2(db, sql, -1, &ck, NULL) == SQLITE_OK) {
+            if (sqlite3_step(ck) == SQLITE_ROW)
+                has = sqlite3_column_int(ck, 0) > 0;
+            sqlite3_finalize(ck);
+        }
+        if (!has) {
+            snprintf(sql, sizeof sql, "ALTER TABLE file_hashes ADD COLUMN %s INTEGER",
+                     XXH_COLS[i]);
+            sqlite3_exec(db, sql, NULL, NULL, NULL); /* 失败忽略：下次打开再试 */
+        }
     }
     *out_db = db;
     return 0;
@@ -326,9 +360,26 @@ static cdc_hashcache_t *load_at(const char *db_path, const char **paths, size_t 
     sqlite3 *db = NULL;
     if (open_conn(db_path, &db) != 0) return c; /* 打不开也返回空缓存 */
     if (migrate_legacy) maybe_migrate_legacy(db);
+    /* 先把输入路径按 strcmp 排好序再逐条加载：entries 是按 path 排序的
+     * 数组，未排序时每次命中都要 entry_insert_at 中间插入、平均移动
+     * 半个数组，N 条命中是 O(n²)（实测：50k 命中约 5.9s，其中 SQL
+     * 本身只占约 0.2s）；排好序后每次插入都在末尾追加，无 memmove。
+     * 去重检查（entry_find）仍有效：重复路径排好序后相邻，第二次查到。
+     * 排序只动指针数组的副本，不改调用方传入的顺序。
+     * malloc 失败时退回原顺序：结果正确，只是慢。 */
+    const char **sorted = NULL;
+    if (n > 1 && paths) {
+        sorted = malloc(n * sizeof(const char *));
+        if (sorted) {
+            memcpy(sorted, paths, n * sizeof(const char *));
+            qsort(sorted, n, sizeof(const char *), cmp_path_ptr);
+            paths = sorted;
+        }
+    }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db,
-                           "SELECT size, mtime, head, sample, strong, full, last_seen"
+                           "SELECT size, mtime, head, sample, strong, full,"
+                           " head_xxh, sample_xxh, strong_xxh, last_seen"
                            " FROM file_hashes WHERE path = ?1",
                            -1, &stmt, NULL) == SQLITE_OK) {
         for (size_t i = 0; i < n; i++) {
@@ -347,7 +398,7 @@ static cdc_hashcache_t *load_at(const char *db_path, const char **paths, size_t 
                 }
                 sqlite3_int64 sz = sqlite3_column_int64(stmt, 0);
                 sqlite3_int64 mt = sqlite3_column_int64(stmt, 1);
-                sqlite3_int64 ls = sqlite3_column_int64(stmt, 6);
+                sqlite3_int64 ls = sqlite3_column_int64(stmt, 9);
                 e.size = sz > 0 ? (uint64_t)sz : 0;
                 e.mtime = mt > 0 ? (uint64_t)mt : 0;
                 e.last_seen = ls > 0 ? (uint64_t)ls : 0;
@@ -363,6 +414,18 @@ static cdc_hashcache_t *load_at(const char *db_path, const char **paths, size_t 
                 e.digests.has_full =
                     blob_to_digest(sqlite3_column_blob(stmt, 5),
                                    sqlite3_column_bytes(stmt, 5), &e.digests.full);
+                if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+                    e.digests.has_head_xxh = 1;
+                    e.digests.head_xxh = (uint64_t)sqlite3_column_int64(stmt, 6);
+                }
+                if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+                    e.digests.has_sample_xxh = 1;
+                    e.digests.sample_xxh = (uint64_t)sqlite3_column_int64(stmt, 7);
+                }
+                if (sqlite3_column_type(stmt, 8) != SQLITE_NULL) {
+                    e.digests.has_strong_xxh = 1;
+                    e.digests.strong_xxh = (uint64_t)sqlite3_column_int64(stmt, 8);
+                }
                 size_t pos = 0;
                 entry_find(c, path, &pos);
                 if (entry_insert_at(c, pos, &e) != 0) free(e.path);
@@ -372,6 +435,7 @@ static cdc_hashcache_t *load_at(const char *db_path, const char **paths, size_t 
         }
         sqlite3_finalize(stmt);
     }
+    free(sorted);
     sqlite3_close(db);
     return c;
 }
@@ -483,6 +547,24 @@ int cdc_hashcache_remember(cdc_hashcache_t *cache, const char *path, uint64_t si
         e->digests.full = digests->full;
         changed = 1;
     }
+    if (digests->has_head_xxh &&
+        (!e->digests.has_head_xxh || e->digests.head_xxh != digests->head_xxh)) {
+        e->digests.has_head_xxh = 1;
+        e->digests.head_xxh = digests->head_xxh;
+        changed = 1;
+    }
+    if (digests->has_sample_xxh &&
+        (!e->digests.has_sample_xxh || e->digests.sample_xxh != digests->sample_xxh)) {
+        e->digests.has_sample_xxh = 1;
+        e->digests.sample_xxh = digests->sample_xxh;
+        changed = 1;
+    }
+    if (digests->has_strong_xxh &&
+        (!e->digests.has_strong_xxh || e->digests.strong_xxh != digests->strong_xxh)) {
+        e->digests.has_strong_xxh = 1;
+        e->digests.strong_xxh = digests->strong_xxh;
+        changed = 1;
+    }
     if (changed) {
         e->last_seen = now;
         e->dirty = 1;
@@ -519,8 +601,9 @@ int cdc_hashcache_save_dirty(cdc_hashcache_t *cache) {
     sqlite3_stmt *stmt = NULL;
     static const char *UPSERT =
         "INSERT INTO file_hashes"
-        " (path, size, mtime, head, sample, strong, full, last_seen)"
-        " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        " (path, size, mtime, head, sample, strong, full,"
+        "  head_xxh, sample_xxh, strong_xxh, last_seen)"
+        " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
         " ON CONFLICT(path) DO UPDATE SET"
         "     size = excluded.size,"
         "     mtime = excluded.mtime,"
@@ -528,6 +611,9 @@ int cdc_hashcache_save_dirty(cdc_hashcache_t *cache) {
         "     sample = COALESCE(excluded.sample, file_hashes.sample),"
         "     strong = COALESCE(excluded.strong, file_hashes.strong),"
         "     full = COALESCE(excluded.full, file_hashes.full),"
+        "     head_xxh = COALESCE(excluded.head_xxh, file_hashes.head_xxh),"
+        "     sample_xxh = COALESCE(excluded.sample_xxh, file_hashes.sample_xxh),"
+        "     strong_xxh = COALESCE(excluded.strong_xxh, file_hashes.strong_xxh),"
         "     last_seen = excluded.last_seen";
     if (sqlite3_prepare_v2(db, UPSERT, -1, &stmt, NULL) == SQLITE_OK) {
         int ok = 1;
@@ -553,7 +639,19 @@ int cdc_hashcache_save_dirty(cdc_hashcache_t *cache) {
                 sqlite3_bind_blob(stmt, 7, e->digests.full.bytes, 32, SQLITE_TRANSIENT);
             else
                 sqlite3_bind_null(stmt, 7);
-            sqlite3_bind_int64(stmt, 8, (sqlite3_int64)e->last_seen);
+            if (e->digests.has_head_xxh)
+                sqlite3_bind_int64(stmt, 8, (sqlite3_int64)e->digests.head_xxh);
+            else
+                sqlite3_bind_null(stmt, 8);
+            if (e->digests.has_sample_xxh)
+                sqlite3_bind_int64(stmt, 9, (sqlite3_int64)e->digests.sample_xxh);
+            else
+                sqlite3_bind_null(stmt, 9);
+            if (e->digests.has_strong_xxh)
+                sqlite3_bind_int64(stmt, 10, (sqlite3_int64)e->digests.strong_xxh);
+            else
+                sqlite3_bind_null(stmt, 10);
+            sqlite3_bind_int64(stmt, 11, (sqlite3_int64)e->last_seen);
             if (sqlite3_step(stmt) != SQLITE_DONE) ok = 0;
             sqlite3_reset(stmt);
             sqlite3_clear_bindings(stmt);
