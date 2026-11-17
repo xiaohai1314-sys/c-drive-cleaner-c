@@ -18,12 +18,37 @@ Rust 版的问题只有一个：编译太慢。搜索速度的瓶颈在磁盘 I/
 安全层、删除逻辑、WebView2 宿主与前后端桥接。按 `docs/ARCHITECTURE.md`
 分片做，每片带自测 + Windows 交叉编译过关。
 
+## 切片 1：基础层（已完成）
+
+- `src/util.{c,h}`：`cdc_buf_t` / `cdc_vec_t` 动态数组、UTF-8/UTF-16
+  转换（`cdc_utf8_to_wide` / `cdc_wide_to_utf8`）、日志 `cdc_log`
+  （写 `%LOCALAPPDATA%\C盘清理工具\logs\`，与 Rust 版同目录）、错误码
+  `cdc_err_t` 与 `#define CDC_OK 0`。自测 `tests/test_util.c`。
+- `third_party/`：SQLite amalgamation 3.54.1、BLAKE3 官方 C 实现 1.8.7、
+  cJSON 1.7.19（版本与来源见 `third_party/README.md`）。
+- 顶层 `CMakeLists.txt` + `cmake/toolchain-mingw64.cmake` +
+  `CMakePresets.json`：MinGW 交叉编译（llvm-mingw）与 MSVC 两条路，
+  C11，`-Wall -Wextra -Werror`（MSVC：`/W4 /WX`，只加给自家目标）。
+- `host/`：由切片 5 提供的原生 COM WebView2 宿主 + 消息桥（`cdc_host`
+  静态库，`bridge.cpp` + `host.cpp`，已交叉编译验证）；顶层
+  `CMakeLists.txt` 只做 `add_subdirectory(host)` 接入，并归一化
+  `CDC_WEBVIEW2_INCLUDE_DIR`（NuGet 包 `Microsoft.Web.WebView2` 的
+  `build/native/include`，以 `-D` 传入）。
+
 ## 构建
 
 ```sh
 # C 后端自测 + 编译（Linux 原生 / Windows 交叉）
 make check
 make time-build
+
+# CMake（与 Makefile 等价，另加第三方库与 host 目标）
+cmake --preset native && cmake --build --preset native && ctest --preset native
+cmake --preset mingw64 && cmake --build --preset mingw64
+# host（WebView2）需要 SDK 头文件：以 -D 传入 NuGet 包的 include 目录
+#   cmake --preset mingw64 -DCDC_WEBVIEW2_INCLUDE_DIR=<.../Microsoft.Web.WebView2/build/native/include>
+# 不传时只报 WARNING，host 编译会在缺 WebView2.h 时失败；本机验证可用
+# 切片 5 的桩头文件 /tmp/cdc-host-test/include（仅供交叉编译验证，不当真 SDK）。
 
 # 前端
 cd web && npm ci && npm run build
