@@ -127,6 +127,12 @@ void cdc_log(cdc_log_level_t level, const char *fmt, ...);
  * 目录无法确定/创建返回 CDC_ERR_IO。 */
 int cdc_log_dir(char *out, size_t cap);
 
+/* 缓存目录：%LOCALAPPDATA%\C盘清理工具\mftcache\（与 Rust cache_dir() 同规则；
+ * LOCALAPPDATA 未设置时退回可执行文件所在目录，再退回 "."）。目录不存在则创建。
+ * 返回 malloc'd 字符串，调用方 free；失败返回 NULL。
+ * 唯一实现在这里；mft.h / logs.h 的同名声明只是复用同一原型（不要另写实现）。 */
+char *cdc_cache_dir(void);
+
 /* 覆盖日志文件名（仅文件名，不含路径；不许含 '/'、'\\' 或 ".."，否则
  * 返回 CDC_ERR_INVALID_ARG 且保持原值）。默认文件名是 cdc-YYYYMMDD.log
  *（按本地日期每天一个文件）；调用方可改为固定名，如 index-20261117.log。 */

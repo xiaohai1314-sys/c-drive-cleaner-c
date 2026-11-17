@@ -45,14 +45,34 @@ target_include_directories(cdc_util PUBLIC src)
 target_link_libraries(cdc_util PRIVATE Threads::Threads)
 cdc_strict(cdc_util)
 
-# ---------------- 试点 CLI（种子） ----------------
+# ---------------- 试点 CLI ----------------
+# 入口 + 索引 + 真哈希管线（与 Makefile 的 SRCS / MFT_NATIVE_OBJ 对齐，
+# 2026-11-17 补：fileindex / indextask / hashcache / scan / fastio / mft；
+# 临时桩 hashcache_scan_stub.c 已删，不再列入）。
 add_executable(cdc-c-pilot
   src/main.c
   src/mft_util.c
   src/bigfile.c
   src/mft_raw.c
+  src/fileindex.c
+  src/indextask.c
+  src/hashcache.c
+  src/scan.c
+  src/fastio.c
+  src/mft.c
 )
-target_link_libraries(cdc-c-pilot PRIVATE cdc_util)
+# hashcache.c 用 cJSON 做 v2 JSON 缓存迁移；scan.c 用 BLAKE3；fileindex /
+# hashcache 用 SQLite。PUBLIC include 目录随链接自动带入。
+target_link_libraries(cdc-c-pilot PRIVATE cdc_util sqlite3 blake3 cjson)
+if(WIN32)
+  # indextask.c（计划任务 SID）与 mft.c（卷操作）要这两个系统库。
+  target_link_libraries(cdc-c-pilot PRIVATE advapi32 shell32)
+endif()
+# mft.c 在非 Windows 下要 POSIX 声明（lstat 等），与 Makefile 一致。
+if(NOT WIN32)
+  set_source_files_properties(src/mft.c PROPERTIES
+    COMPILE_DEFINITIONS "_POSIX_C_SOURCE=200809L;_DEFAULT_SOURCE=1")
+endif()
 cdc_strict(cdc-c-pilot)
 
 # ---------------- util 自测 ----------------

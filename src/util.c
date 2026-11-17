@@ -606,6 +606,55 @@ int cdc_log_dir(char *out, size_t cap) {
     return rc;
 }
 
+/* 缓存目录 %LOCALAPPDATA%\C盘清理工具\mftcache（不存在则创建），malloc'd，
+ * 调用方 free。规则与 cdc_log_dir 同款：LOCALAPPDATA 未设置时退回可执行
+ * 文件所在目录，再退回 "."。
+ *
+ * 唯一实现：此前 mft.c 和 logs.c 各有一份，mft.c 的那份把"盘"写了两遍
+ * （"C盘盘清理工具"，2026-11-17 切片 4 端到端验证发现），且两份同链会
+ * 符号冲突；现统一到这里，两处旧实现已删。目录名是"C盘清理工具"
+ * （一个"盘"），不要写成"C盘盘清理工具"。 */
+char *cdc_cache_dir(void) {
+#ifdef _WIN32
+    wchar_t wpath[4096];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", wpath, 4096);
+    if (n == 0 || n >= 4096) {
+        /* 回退：可执行文件所在目录。 */
+        n = GetModuleFileNameW(NULL, wpath, 4096);
+        if (n == 0 || n >= 4096) return NULL;
+        wchar_t *slash = wcsrchr(wpath, L'\\');
+        if (!slash) return NULL;
+        *slash = L'\0';
+    }
+    if (wcslen(wpath) + wcslen(L"\\C盘清理工具\\mftcache") + 1 > 4096) return NULL;
+    CDC_WCSCAT(wpath, 4096, L"\\C盘清理工具\\mftcache");
+    mkdir_p_w(wpath);
+    return cdc_wide_to_utf8(wpath);
+#else
+    char base[4096], path[4096];
+    const char *env = getenv("LOCALAPPDATA");
+    if (env && env[0] != '\0') {
+        if (str_copy(base, sizeof base, env) != CDC_OK) return NULL;
+    } else {
+        char exe[4096];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0) {
+            char *slash;
+            exe[n] = '\0';
+            slash = strrchr(exe, '/');
+            if (slash) *slash = '\0';
+            if (str_copy(base, sizeof base, exe) != CDC_OK) return NULL;
+        } else {
+            if (str_copy(base, sizeof base, ".") != CDC_OK) return NULL;
+        }
+    }
+    if (str_concat3(path, sizeof path, base, "/C盘清理工具/mftcache", "") != CDC_OK)
+        return NULL;
+    mkdir_p(path);
+    return strdup(path);
+#endif
+}
+
 void cdc_log(cdc_log_level_t level, const char *fmt, ...) {
     char msg[2048];
     /* "%04d-%02d-%02d %02d:%02d:%02d"：6 个 int 最坏各 11 字符 + 5 个分隔符
